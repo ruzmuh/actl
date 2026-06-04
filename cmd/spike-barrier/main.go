@@ -67,13 +67,24 @@ func run(workflowPath, event, image string) error {
 		Secrets:     map[string]string{},
 		Vars:        map[string]string{},
 
-		// The whole point of Spike 2: pause before every step.
+		// The whole point of Spike 2: pause at every step boundary (before and
+		// after each step's main executor).
 		StepBarrier: func(_ context.Context, info runner.StepBarrierInfo) error {
-			fmt.Printf("\n⏸️  PAUSED before step %d: %q  [%s]\n",
-				info.Index+1, info.Step.String(), kind(info.Step))
-			fmt.Print("   press Enter to resume the step (or Ctrl-C to quit)... ")
+			switch info.When {
+			case runner.BarrierBefore:
+				fmt.Printf("\n⏸️  PAUSED %-6s step %d: %q  [%s]\n",
+					info.When, info.Index+1, info.Step.String(), kind(info.Step))
+			case runner.BarrierAfter:
+				outcome := "✅ ok"
+				if info.Err != nil {
+					outcome = "❌ FAILED: " + info.Err.Error()
+				}
+				fmt.Printf("\n⏸️  PAUSED %-6s step %d: %q  → %s\n",
+					info.When, info.Index+1, info.Step.String(), outcome)
+			}
+			fmt.Print("   press Enter to resume (or Ctrl-C to quit)... ")
 			stdin.Scan()
-			fmt.Printf("▶️  resuming step %d\n\n", info.Index+1)
+			fmt.Println("▶️  resuming")
 			return nil
 		},
 	}
