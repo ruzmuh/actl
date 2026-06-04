@@ -1,6 +1,7 @@
 # build output
 /dist/
 /actl
+/spike-barrier
 *.test
 
 # local dev workspace (editor convenience; the build resolves act via the
