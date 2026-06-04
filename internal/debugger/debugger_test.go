@@ -32,6 +32,19 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestInspectionNilWhileRunning(t *testing.T) {
+	s, err := New(Options{WorkflowPath: sampleWorkflow, Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Env() != nil {
+		t.Errorf("Env() = %v, want nil before a pause", s.Env())
+	}
+	if s.ContainerName() != "" {
+		t.Errorf("ContainerName() = %q, want empty before a pause", s.ContainerName())
+	}
+}
+
 func TestSingleJobOnly(t *testing.T) {
 	if _, err := New(Options{WorkflowPath: "testdata/two-jobs.yml", Workdir: t.TempDir()}); err == nil {
 		t.Fatal("expected an error for a multi-job workflow, got nil")

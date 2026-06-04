@@ -89,10 +89,12 @@ type Session struct {
 	factory *logFactory
 	done    chan struct{}
 
-	mu          sync.Mutex
-	curMode     mode
-	breakpoints map[int]bool
-	breakOnErr  bool
+	mu           sync.Mutex
+	curMode      mode
+	breakpoints  map[int]bool
+	breakOnErr   bool
+	curEnv       map[string]string // live env at the current pause (nil while running)
+	curContainer string            // job container name at the current pause
 
 	err error // run result, valid once Done is closed
 }
@@ -252,6 +254,13 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 		return nil
 	}
 
+	// Publish the live inspection state for the duration of the pause. act is
+	// blocked here, so the env map is stable to read.
+	s.mu.Lock()
+	s.curEnv = info.Env
+	s.curContainer = info.ContainerName
+	s.mu.Unlock()
+
 	ev := PauseEvent{When: toWhen(info.When), Index: info.Index, Step: info.Step, Err: info.Err}
 	select {
 	case s.pauses <- ev:
@@ -263,6 +272,8 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 	case c := <-s.resume:
 		s.mu.Lock()
 		s.curMode = c.mode
+		s.curEnv = nil
+		s.curContainer = ""
 		s.mu.Unlock()
 		if c.abort {
 			return ErrAborted
@@ -271,6 +282,30 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Env returns a copy of the job's environment captured at the current pause, or
+// nil while the run is executing. Inspection is only meaningful while paused.
+func (s *Session) Env() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.curEnv == nil {
+		return nil
+	}
+	out := make(map[string]string, len(s.curEnv))
+	for k, v := range s.curEnv {
+		out[k] = v
+	}
+	return out
+}
+
+// ContainerName is the docker name of the live job container at the current
+// pause (empty while running or if no container is in use). A frontend can drop
+// an interactive shell into it; the core stays out of the terminal (CLAUDE.md §5).
+func (s *Session) ContainerName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.curContainer
 }
 
 // shouldHalt is the halt/pass policy. Step mode halts everywhere; Continue mode

@@ -8,6 +8,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -26,10 +28,11 @@ const (
 
 // messages bridging the core's channels into the Bubble Tea event loop.
 type (
-	pauseMsg    debugger.PauseEvent
-	logMsg      string
-	logsDoneMsg struct{}
-	doneMsg     struct{ err error }
+	pauseMsg     debugger.PauseEvent
+	logMsg       string
+	logsDoneMsg  struct{}
+	doneMsg      struct{ err error }
+	shellDoneMsg struct{ err error }
 )
 
 // Model is the actl TUI state.
@@ -45,8 +48,9 @@ type Model struct {
 	curAt  debugger.When
 	curErr error
 
-	logs   []string
-	runErr error
+	logs    []string
+	runErr  error
+	showEnv bool // env pane instead of log pane
 
 	width, height int
 }
@@ -128,6 +132,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateRunning
 				return m, m.waitPause
 			}
+		case "e":
+			m.showEnv = !m.showEnv
+			return m, nil
+		case "d":
+			if m.state == statePaused {
+				if name := m.sess.ContainerName(); name != "" {
+					// Hand the terminal to an interactive shell in the live
+					// container, then resume the TUI. The core stays out of the
+					// terminal; this is the frontend's job (CLAUDE.md §5).
+					c := exec.Command("docker", "exec", "-it", name, "sh", "-c",
+						"[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh")
+					return m, tea.ExecProcess(c, func(err error) tea.Msg { return shellDoneMsg{err} })
+				}
+			}
 		}
 		return m, nil
 
@@ -148,6 +166,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logsDoneMsg:
 		return m, nil
 
+	case shellDoneMsg:
+		if msg.err != nil {
+			m.logs = append(m.logs, "shell: "+msg.err.Error())
+		}
+		return m, nil
+
 	case doneMsg:
 		m.state = stateFinished
 		m.runErr = msg.err
@@ -165,6 +189,7 @@ var (
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	keyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	statusStyle = lipgloss.NewStyle().Bold(true)
 )
 
@@ -191,11 +216,38 @@ func (m Model) View() string {
 	}
 	b.WriteString(paneStyle.Width(m.paneWidth()).Render("STEPS\n"+strings.TrimRight(steps.String(), "\n")) + "\n")
 
-	// log pane (tail)
-	b.WriteString(paneStyle.Width(m.paneWidth()).Render("LOGS\n"+m.logTail()) + "\n")
+	// bottom pane: env (while inspecting) or log tail
+	if m.showEnv {
+		b.WriteString(paneStyle.Width(m.paneWidth()).Render("ENV (job-scoped)\n"+m.envPane()) + "\n")
+	} else {
+		b.WriteString(paneStyle.Width(m.paneWidth()).Render("LOGS\n"+m.logTail()) + "\n")
+	}
 
 	b.WriteString(m.statusLine())
 	return b.String()
+}
+
+func (m Model) envPane() string {
+	env := m.sess.Env()
+	if len(env) == 0 {
+		return dimStyle.Render("(environment is available only while paused)")
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	limit := m.logHeight()
+	var b strings.Builder
+	for i, k := range keys {
+		if i >= limit {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("… %d more", len(keys)-limit)))
+			break
+		}
+		b.WriteString(keyStyle.Render(k) + dimStyle.Render("=") + env[k] + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func (m Model) paneWidth() int {
@@ -234,7 +286,7 @@ func (m Model) statusLine() string {
 		if m.curErr != nil {
 			where += errStyle.Render(" — step failed: "+m.curErr.Error())
 		}
-		return statusStyle.Render("⏸  paused "+where) + dimStyle.Render("   ·  [s]tep  [c]ontinue  [q]uit")
+		return statusStyle.Render("⏸  paused "+where) + dimStyle.Render("   ·  [s]tep  [c]ontinue  [e]nv  [d]shell  [q]uit")
 	case stateRunning:
 		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  [q]uit")
 	default:

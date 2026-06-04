@@ -66,6 +66,8 @@ func run(workflowPath, event, image string) error {
 		select {
 		case ev := <-sess.Pauses():
 			fmt.Printf("\n⏸️  %-6s step %d: %q%s\n", ev.When, ev.Index+1, ev.Step.String(), outcome(ev))
+			fmt.Printf("   container=%s  env=%d vars  (e.g. CI=%q)\n",
+				sess.ContainerName(), len(sess.Env()), sess.Env()["CI"])
 			fmt.Print("   > ")
 			cmd := ""
 			if stdin.Scan() {

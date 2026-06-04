@@ -40,6 +40,13 @@ func TestModelFlow(t *testing.T) {
 		t.Errorf("log line not rendered:\n%s", got)
 	}
 
+	// toggle the env pane (no live run, so it shows the paused-only hint)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if got := m.View(); !strings.Contains(got, "ENV (job-scoped)") {
+		t.Errorf("env pane not shown after toggle:\n%s", got)
+	}
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")}) // toggle back
+
 	// completion
 	m, _ = m.Update(doneMsg{})
 	if got := m.View(); !strings.Contains(got, "run complete") {
