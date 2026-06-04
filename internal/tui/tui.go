@@ -99,6 +99,10 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 func needsLines(summaries []debugger.NeedsSummary) []string {
 	lines := make([]string, 0, len(summaries))
 	for _, n := range summaries {
+		if n.Live {
+			lines = append(lines, fmt.Sprintf("needs %q runs live before this job (real outputs)", n.Job))
+			continue
+		}
 		result := n.Result
 		if n.Assumed {
 			result += " (assumed)"

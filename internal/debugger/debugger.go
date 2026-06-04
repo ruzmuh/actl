@@ -46,10 +46,12 @@ type NeedsInput struct {
 }
 
 // NeedsSummary describes how one of the selected job's needs was satisfied
-// locally, for a transparency line. Result is the effective value; Assumed is
-// true when it was defaulted rather than supplied.
+// locally, for a transparency line. With Live (the --with-deps mode) the upstream
+// job runs for real and the seeded fields are unused; otherwise Result is the
+// effective value (Assumed when defaulted) and Outputs holds the seeded keys.
 type NeedsSummary struct {
 	Job     string
+	Live    bool
 	Result  string
 	Assumed bool
 	Outputs map[string]string
@@ -60,11 +62,12 @@ type Options struct {
 	WorkflowPath string                // path to the workflow file
 	EventName    string                // event to plan for (default "push")
 	JobID        string                // which job to debug; required only if the event plans more than one
+	WithDeps     bool                  // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
 	Image        string                // docker image mapped to ubuntu-latest (default catthehacker)
 	Workdir      string                // job workdir; a temp dir is created and cleaned up if empty
 	Secrets      map[string]string     // secrets exposed to the workflow
 	Env          map[string]string     // extra env for containers
-	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id
+	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
 	BreakOnError bool                  // in Continue mode, halt after a step that errored
 	Breakpoints  []int                 // zero-based step indices to halt before, in Continue mode
 }
@@ -108,12 +111,13 @@ type control struct {
 
 // Session is one debug run of a single job. Construct with New, then Start.
 type Session struct {
-	jobID  string
-	steps  []*model.Step
-	needs  []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
-	runner runner.Runner
-	plan   *model.Plan
-	tmpDir string // non-empty if we created (and must clean up) the workdir
+	jobID    string
+	steps    []*model.Step
+	needs    []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
+	withDeps bool           // upstream needs run for real before the target job
+	runner   runner.Runner
+	plan     *model.Plan
+	tmpDir   string // non-empty if we created (and must clean up) the workdir
 
 	pauses  chan PauseEvent
 	resume  chan control
@@ -163,19 +167,25 @@ func New(opts Options) (*Session, error) {
 		return nil, err
 	}
 
-	// Execute ONLY the selected job. act's planners expand the dependency
-	// closure (PlanEvent plans every job; even PlanJob pulls in job.Needs()
-	// transitively via createStages), and NewPlanExecutor runs the whole plan —
-	// so we must hand it a plan holding just this one run, or its upstream jobs
-	// run too. Isolation is the v0.1 contract.
-	isolated := &model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{run}}}}
-
-	// In isolation the upstream jobs never run, so seed the needs context the
-	// downstream job reads (act resolves needs.<job>.* straight from the workflow
-	// model). Unseeded outputs are simply absent → empty, exactly as GitHub
-	// resolves a non-existent output; the result defaults to success so typical
-	// `if: needs.x.result == 'success'` gates don't skip the whole job.
-	needs := seedNeeds(run, opts.Needs)
+	// Two execution modes. With WithDeps we run the full plan: act executes the
+	// upstream jobs for real (so needs.* are genuine), and the barrier halts only
+	// on the target job's steps (see shouldHalt's JobID gate). Otherwise we
+	// isolate: act's planners expand the dependency closure (PlanEvent plans every
+	// job; even PlanJob pulls in job.Needs() transitively) and NewPlanExecutor runs
+	// the whole plan, so we hand it a plan holding just this one run, and seed the
+	// needs context the job reads straight from the workflow model.
+	var execPlan *model.Plan
+	var needs []NeedsSummary
+	if opts.WithDeps {
+		execPlan = plan
+		needs = liveNeeds(run)
+	} else {
+		execPlan = &model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{run}}}}
+		// Unseeded outputs are simply absent → empty, exactly as GitHub resolves a
+		// non-existent output; the result defaults to success so typical
+		// `if: needs.x.result == 'success'` gates don't skip the whole job.
+		needs = seedNeeds(run, opts.Needs)
+	}
 
 	workdir := opts.Workdir
 	var tmpDir string
@@ -198,7 +208,8 @@ func New(opts Options) (*Session, error) {
 		jobID:       run.JobID,
 		steps:       run.Job().Steps,
 		needs:       needs,
-		plan:        isolated,
+		withDeps:    opts.WithDeps,
+		plan:        execPlan,
 		tmpDir:      tmpDir,
 		pauses:      make(chan PauseEvent),
 		resume:      make(chan control),
@@ -238,9 +249,13 @@ func (s *Session) JobID() string { return s.jobID }
 // before the run starts).
 func (s *Session) Steps() []*model.Step { return s.steps }
 
-// NeedsSummary reports how the selected job's needs were satisfied in isolation,
-// for a transparency line. Empty when the job has no needs.
+// NeedsSummary reports how the selected job's needs were satisfied (seeded in
+// isolation, or live with --with-deps), for a transparency line. Empty when the
+// job has no needs.
 func (s *Session) NeedsSummary() []NeedsSummary { return s.needs }
+
+// WithDeps reports whether the job's upstream needs run for real before it.
+func (s *Session) WithDeps() bool { return s.withDeps }
 
 // Start launches the run in the background. The run halts at the first barrier
 // (before the first step) per the default Step mode; drive it via the control
@@ -433,6 +448,12 @@ func (s *Session) Rerun() error {
 func (s *Session) shouldHalt(info runner.StepBarrierInfo) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// In --with-deps the full plan runs; the upstream jobs must run to completion
+	// without pausing. Only ever halt on the job being debugged. (In isolation the
+	// only job is the target, so this is a no-op.)
+	if info.JobID != "" && info.JobID != s.jobID {
+		return false
+	}
 	if s.curMode == modeStep {
 		return true
 	}
@@ -483,6 +504,20 @@ func jobIDsOf(runs []*model.Run) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// liveNeeds lists the selected job's needs for a transparency line in --with-deps
+// mode, where the upstream jobs run for real (no seeding).
+func liveNeeds(run *model.Run) []NeedsSummary {
+	job := run.Job()
+	if job == nil {
+		return nil
+	}
+	out := make([]NeedsSummary, 0, len(job.Needs()))
+	for _, name := range job.Needs() {
+		out = append(out, NeedsSummary{Job: name, Live: true})
+	}
+	return out
 }
 
 // seedNeeds writes the selected job's upstream needs into the workflow model so

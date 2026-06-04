@@ -91,6 +91,49 @@ func TestIsolatedPlan(t *testing.T) {
 	}
 }
 
+// TestWithDepsRunsFullPlan checks that --with-deps executes the whole plan (so
+// upstream jobs run for real) and marks the needs as live.
+func TestWithDepsRunsFullPlan(t *testing.T) {
+	s, err := New(Options{WorkflowPath: "../../testdata/workflows/pipeline.yml", JobID: "deploy", WithDeps: true, Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.WithDeps() {
+		t.Error("WithDeps() = false, want true")
+	}
+	runs := 0
+	for _, st := range s.plan.Stages {
+		runs += len(st.Runs)
+	}
+	if runs != 3 {
+		t.Errorf("plan runs = %d, want 3 (build, test, deploy)", runs)
+	}
+	sum := s.NeedsSummary()
+	if len(sum) != 2 {
+		t.Fatalf("NeedsSummary = %+v, want 2 live entries", sum)
+	}
+	for _, n := range sum {
+		if !n.Live {
+			t.Errorf("need %q: Live = false, want true", n.Job)
+		}
+	}
+}
+
+// TestShouldHaltSkipsOtherJobs covers the --with-deps gate: barriers from jobs
+// other than the one being debugged must always pass through.
+func TestShouldHaltSkipsOtherJobs(t *testing.T) {
+	s := &Session{curMode: modeStep, jobID: "deploy"}
+	if s.shouldHalt(runner.StepBarrierInfo{When: runner.BarrierBefore, JobID: "build"}) {
+		t.Error("halted on a non-target job; want pass-through")
+	}
+	if !s.shouldHalt(runner.StepBarrierInfo{When: runner.BarrierBefore, JobID: "deploy"}) {
+		t.Error("did not halt on the target job in step mode")
+	}
+	if !s.shouldHalt(runner.StepBarrierInfo{When: runner.BarrierBefore, JobID: ""}) {
+		t.Error("empty JobID should be treated as the target (isolation)")
+	}
+}
+
 // TestSeedNeeds verifies isolated-run needs seeding: outputs are replaced by only
 // the supplied keys (so unseeded ones resolve empty, like GitHub), and the result
 // defaults to success unless overridden.

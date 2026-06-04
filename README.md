@@ -85,15 +85,26 @@ go run ./cmd/actl -job deploy \
 
 Unseeded outputs resolve to empty (exactly as a non-existent output does in GitHub); an
 unseeded `result` defaults to `success`. The TUI prints a transparency line per need so you
-see precisely what the isolated run stands on. `go test ./...` runs the tests (no Docker needed).
+see precisely what the isolated run stands on.
+
+Prefer to exercise the real dependencies instead of seeding them? `--with-deps` runs the
+upstream jobs for real to completion first, then pauses only on the target job's steps — so
+`needs.*` are genuine and there's nothing to seed (upstream output streams to the log pane):
+
+```sh
+go run ./cmd/actl -job deploy --with-deps testdata/workflows/pipeline.yml
+```
+
+`go test ./...` runs the tests (no Docker needed).
 
 ## Roadmap
 
 See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md). Done so far:
 library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI (step/inspect/shell/
-edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓.
-Next: run-dependencies-then-debug (`--with-deps`) → full multi-job graph → ambient identity
-substitution → `uses:` verification → upstream the hook.
+edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓ →
+run-dependencies-then-debug (`--with-deps`) ✓.
+Next: full multi-job graph (step through every job) → ambient identity substitution →
+`uses:` verification → upstream the hook.
 
 ## License
 

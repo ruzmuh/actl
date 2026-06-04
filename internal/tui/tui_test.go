@@ -28,6 +28,12 @@ func TestNeedsLines(t *testing.T) {
 		!strings.Contains(lines[1], "none") {
 		t.Errorf("test line wrong: %q", lines[1])
 	}
+
+	// --with-deps: the upstream job runs for real, so the line says "live"
+	live := needsLines([]debugger.NeedsSummary{{Job: "build", Live: true}})
+	if len(live) != 1 || !strings.Contains(live[0], `needs "build"`) || !strings.Contains(live[0], "live") {
+		t.Errorf("live line wrong: %v", live)
+	}
 }
 
 // TestModelFlow drives the model through synthetic core messages and checks the
