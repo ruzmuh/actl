@@ -28,34 +28,40 @@ with faithful `uses:` execution (docker / composite / node actions).
 ## Layout
 
 ```
-cmd/actl/           entry point (currently the Spike-1 library probe)
+cmd/actl/           TUI entry point
+cmd/spike-barrier/  line-based driver over the core (dev/debug aid)
+internal/debugger/  the pause-barrier core: Session, pause/step/continue, log capture
+internal/tui/       Bubble Tea front-end over the core
 internal/workflow/  thin wrapper over act/pkg/model
 internal/expr/      thin wrapper over act/pkg/exprparser
-internal/debugger/  the pause-barrier core            (coming)
-internal/tui/       Bubble Tea front-end               (coming)
 third_party/act/    soft fork of act — git submodule → ruzmuh/act (branch actl), pinned by SHA
 testdata/workflows/ sample workflows
 ```
 
 ## Develop
 
-Requires Go (the module pins the toolchain to match act; `go` auto-fetches it). Docker is
-needed once real execution lands.
+Requires Go (the module pins the toolchain to match act; `go` auto-fetches it) and **Docker**
+(act starts a real job container and execs each step into it).
 
 The act fork lives in a submodule, so clone with `--recurse-submodules` (or run
 `git submodule update --init` afterwards):
 
 ```sh
 git clone --recurse-submodules https://github.com/ruzmuh/actl
-go run ./cmd/actl                              # parse the sample workflow + eval expressions
-go run ./cmd/actl path/to/your/workflow.yml    # try your own
+go run ./cmd/actl                          # debug the sample workflow in the TUI
+go run ./cmd/actl path/to/workflow.yml     # your own workflow
+go run ./cmd/actl -image node:20-bullseye-slim   # smaller image for quick run-only workflows
 ```
+
+In the TUI: `s` step · `c` continue · `q` quit. The run halts before the first step;
+break-on-error halts after a failing step. `go test ./internal/...` runs the core/TUI tests
+(no Docker needed).
 
 ## Roadmap
 
 See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md). In short:
-library spike (done) → fork + pause barrier → minimal TUI → `uses:` verification →
-ambient identity substitution → upstream the hook.
+library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → minimal TUI ✓ →
+`uses:` verification → ambient identity substitution → upstream the hook.
 
 ## License
 

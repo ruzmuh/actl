@@ -18,6 +18,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
 )
@@ -37,12 +38,28 @@ type Options struct {
 	Breakpoints  []int             // zero-based step indices to halt before, in Continue mode
 }
 
+// When marks which side of a step's main executor a pause occurred on. It mirrors
+// the fork's runner.BarrierWhen but keeps act's type out of frontend code.
+type When int
+
+const (
+	Before When = iota // before the step's main executor ran
+	After              // after the step's main executor returned
+)
+
+func (w When) String() string {
+	if w == After {
+		return "after"
+	}
+	return "before"
+}
+
 // PauseEvent is emitted when the run halts at a step boundary.
 type PauseEvent struct {
-	When  runner.BarrierWhen // before or after the step's main executor
-	Index int                // zero-based step index within the job
-	Step  *model.Step        // the step at this boundary
-	Err   error              // for When==BarrierAfter: the step's error, or nil
+	When  When        // before or after the step's main executor
+	Index int         // zero-based step index within the job
+	Step  *model.Step // the step at this boundary
+	Err   error       // for When==After: the step's error, or nil
 }
 
 // mode is the run policy consulted at each barrier.
@@ -66,9 +83,11 @@ type Session struct {
 	plan    *model.Plan
 	tmpDir  string // non-empty if we created (and must clean up) the workdir
 
-	pauses chan PauseEvent
-	resume chan control
-	done   chan struct{}
+	pauses  chan PauseEvent
+	resume  chan control
+	logs    chan string
+	factory *logFactory
+	done    chan struct{}
 
 	mu          sync.Mutex
 	curMode     mode
@@ -128,11 +147,13 @@ func New(opts Options) (*Session, error) {
 		tmpDir:      tmpDir,
 		pauses:      make(chan PauseEvent),
 		resume:      make(chan control),
+		logs:        make(chan string, 1024),
 		done:        make(chan struct{}),
 		curMode:     modeStep, // stop at entry (before the first step)
 		breakpoints: breakpoints,
 		breakOnErr:  opts.BreakOnError,
 	}
+	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done}}
 
 	cfg := &runner.Config{
 		Workdir:     workdir,
@@ -140,6 +161,7 @@ func New(opts Options) (*Session, error) {
 		EventName:   opts.EventName,
 		Platforms:   map[string]string{"ubuntu-latest": opts.Image},
 		AutoRemove:  true,
+		LogOutput:   true, // route step stdout through the logger (captured below)
 		Env:         orEmpty(opts.Env),
 		Secrets:     orEmpty(opts.Secrets),
 		Vars:        map[string]string{},
@@ -165,12 +187,20 @@ func (s *Session) Steps() []*model.Step { return s.steps }
 // (before the first step) per the default Step mode; drive it via the control
 // methods and Pauses. Done is closed when the run finishes.
 func (s *Session) Start(ctx context.Context) {
+	// Route act's logging into our sink (see logFactory) so it never reaches the
+	// terminal a frontend may own. WithJobLoggerFactory covers per-job/step
+	// loggers; the base WithLogger covers anything logged before the job logger.
+	ctx = common.WithLogger(runner.WithJobLoggerFactory(ctx, s.factory), s.factory.WithJobLogger())
 	go func() {
 		defer close(s.done)
 		defer s.cleanup()
 		s.err = s.runner.NewPlanExecutor(s.plan)(ctx)
 	}()
 }
+
+// Logs delivers act's output line by line (job + step logs, with secrets masked).
+// Drain it concurrently; it is buffered but a frontend should keep reading.
+func (s *Session) Logs() <-chan string { return s.logs }
 
 // Pauses delivers a PauseEvent each time the run halts. The run stays blocked
 // until a control method (Step/Continue/Abort) is called.
@@ -222,7 +252,7 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 		return nil
 	}
 
-	ev := PauseEvent{When: info.When, Index: info.Index, Step: info.Step, Err: info.Err}
+	ev := PauseEvent{When: toWhen(info.When), Index: info.Index, Step: info.Step, Err: info.Err}
 	select {
 	case s.pauses <- ev:
 	case <-ctx.Done():
@@ -280,6 +310,13 @@ func singleRun(plan *model.Plan) (*model.Run, error) {
 	default:
 		return nil, fmt.Errorf("debugger: v0.1 supports a single job, but the plan has %d", len(runs))
 	}
+}
+
+func toWhen(w runner.BarrierWhen) When {
+	if w == runner.BarrierAfter {
+		return After
+	}
+	return Before
 }
 
 func orEmpty(m map[string]string) map[string]string {

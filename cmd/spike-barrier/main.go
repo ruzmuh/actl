@@ -20,8 +20,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/nektos/act/pkg/runner"
-
 	"github.com/ruzmuh/actl/internal/debugger"
 )
 
@@ -57,6 +55,13 @@ func run(workflowPath, event, image string) error {
 	stdin := bufio.NewScanner(os.Stdin)
 	sess.Start(context.Background())
 
+	// Drain captured act logs (proves they no longer hit stderr).
+	go func() {
+		for line := range sess.Logs() {
+			fmt.Printf("│ %s\n", line)
+		}
+	}()
+
 	for {
 		select {
 		case ev := <-sess.Pauses():
@@ -88,7 +93,7 @@ func run(workflowPath, event, image string) error {
 }
 
 func outcome(ev debugger.PauseEvent) string {
-	if ev.When != runner.BarrierAfter {
+	if ev.When != debugger.After {
 		return ""
 	}
 	if ev.Err != nil {

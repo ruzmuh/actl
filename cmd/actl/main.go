@@ -1,29 +1,30 @@
-// Command actl is the entry point for the actl debugger.
+// Command actl is the TUI step-debugger for GitHub Actions workflows. It runs a
+// workflow locally through act's engine, pausing before/after each step so you
+// can drive it interactively.
 //
-// SPIKE STATUS (Spike 1 of the roadmap in CLAUDE.md): for now this binary only
-// proves that act's libraries import and work as plain dependencies — it parses
-// a workflow via act/pkg/model and evaluates a ${{ }} expression via
-// act/pkg/exprparser. The Bubble Tea TUI and the pause-barrier debugger come in
-// later spikes; this main will be replaced once the core lands.
+//	actl [flags] [workflow.yml]
+//
+// Requires Docker: act starts a real job container and execs each step into it.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 
-	"github.com/nektos/act/pkg/exprparser"
-	"github.com/nektos/act/pkg/model"
+	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/ruzmuh/actl/internal/expr"
-	"github.com/ruzmuh/actl/internal/workflow"
+	"github.com/ruzmuh/actl/internal/debugger"
+	"github.com/ruzmuh/actl/internal/tui"
 )
 
 func main() {
-	strict := flag.Bool("strict", false, "validate the workflow against the GitHub Actions schema")
+	event := flag.String("event", "push", "event name to plan for")
+	image := flag.String("image", "catthehacker/ubuntu:act-latest", "docker image mapped to ubuntu-latest (first run pulls it)")
+	breakOnError := flag.Bool("break-on-error", true, "halt after a step that fails")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: actl [flags] [workflow.yml]\n\n")
-		fmt.Fprintf(os.Stderr, "Spike: parse a workflow and evaluate a sample expression.\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -33,47 +34,28 @@ func main() {
 		path = flag.Arg(0)
 	}
 
-	if err := run(path, *strict); err != nil {
+	if err := run(path, *event, *image, *breakOnError); err != nil {
 		fmt.Fprintln(os.Stderr, "actl:", err)
 		os.Exit(1)
 	}
 }
 
-func run(path string, strict bool) error {
-	wf, err := workflow.Load(path, strict)
+func run(path, event, image string, breakOnError bool) error {
+	sess, err := debugger.New(debugger.Options{
+		WorkflowPath: path,
+		EventName:    event,
+		Image:        image,
+		BreakOnError: breakOnError,
+	})
 	if err != nil {
 		return err
 	}
 
-	// --- 1. workflow parsing (act/pkg/model) ---
-	fmt.Printf("workflow %q  (%s)\n", wf.Name, wf.File)
-	fmt.Printf("  on: %v\n", wf.On())
-	for jobID, job := range wf.Jobs {
-		fmt.Printf("  job %q\n", jobID)
-		for i, step := range job.Steps {
-			fmt.Printf("    %d. [%-7s] %s\n", i+1, workflow.KindOf(step), step.String())
-		}
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess.Start(ctx)
 
-	// --- 2. expression evaluation (act/pkg/exprparser) ---
-	env := &exprparser.EvaluationEnvironment{
-		Github: &model.GithubContext{EventName: "push"},
-		Env:    wf.Env,
-	}
-	fmt.Println("\nexpression checks:")
-	for _, in := range []string{
-		"github.event_name",
-		"github.event_name == 'push'",
-		"format('{0} world', env.GREETING)",
-		// Note: the GHA expression language has no arithmetic operators — only
-		// comparison, logic, indexing, and a fixed set of functions.
-		"contains('step-debugger', 'bug') && startsWith(env.GREETING, 'hel')",
-	} {
-		v, err := expr.Evaluate(in, env)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("  %-40s => %v\n", in, v)
-	}
-	return nil
+	p := tea.NewProgram(tui.New(sess, cancel), tea.WithAltScreen())
+	_, err = p.Run()
+	return err
 }
