@@ -153,7 +153,7 @@ func New(opts Options) (*Session, error) {
 		breakpoints: breakpoints,
 		breakOnErr:  opts.BreakOnError,
 	}
-	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done}}
+	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done, drop: isGitContextNoise}}
 
 	cfg := &runner.Config{
 		Workdir:     workdir,

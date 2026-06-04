@@ -38,6 +38,25 @@ func TestSingleJobOnly(t *testing.T) {
 	}
 }
 
+func TestGitContextNoiseFiltered(t *testing.T) {
+	drop := []string{
+		"path/tmp/actl-123not located inside a git repository",
+		"unable to get git ref: repository does not exist",
+		"unable to get git revision: repository does not exist",
+	}
+	for _, l := range drop {
+		if !isGitContextNoise(l) {
+			t.Errorf("expected dropped, kept: %q", l)
+		}
+	}
+	keep := []string{"⭐ Run Main first", "step one", "🏁  Job succeeded", "git status looks fine"}
+	for _, l := range keep {
+		if isGitContextNoise(l) {
+			t.Errorf("expected kept, dropped: %q", l)
+		}
+	}
+}
+
 // TestShouldHaltPolicy covers the halt/pass decision in isolation (no Docker).
 func TestShouldHaltPolicy(t *testing.T) {
 	info := func(w runner.BarrierWhen, idx int, err error) runner.StepBarrierInfo {

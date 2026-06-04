@@ -35,13 +35,15 @@ func (messageFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	return append([]byte(e.Message), '\n'), nil
 }
 
-// lineWriter buffers writes and emits complete lines to sink. It is safe for
-// concurrent use and never blocks past the run: sends abandon on stop.
+// lineWriter buffers writes and emits complete lines to sink, skipping any line
+// for which drop returns true. It is safe for concurrent use and never blocks
+// past the run: sends abandon on stop.
 type lineWriter struct {
 	mu   sync.Mutex
 	buf  bytes.Buffer
 	sink chan<- string
 	stop <-chan struct{}
+	drop func(string) bool // optional: lines to omit (nil = keep all)
 }
 
 func (w *lineWriter) Write(p []byte) (int, error) {
@@ -56,11 +58,26 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 			w.buf.WriteString(line)
 			break
 		}
+		line = strings.TrimRight(line, "\r\n")
+		if w.drop != nil && w.drop(line) {
+			continue
+		}
 		select {
-		case w.sink <- strings.TrimRight(line, "\r\n"):
+		case w.sink <- line:
 		case <-w.stop:
 			return len(p), nil
 		}
 	}
 	return len(p), nil
+}
+
+// isGitContextNoise matches act's repeated repo-probe diagnostics. act reads git
+// metadata (GITHUB_SHA / GITHUB_REF) from the workdir to build the github
+// context; when the workdir is not a git repo it logs these on every env
+// interpolation. They are irrelevant to step-debugging and would flood the log
+// pane, so the core drops them. (Strings are stable: act is pinned via the fork.)
+func isGitContextNoise(line string) bool {
+	return strings.Contains(line, "not located inside a git repository") ||
+		strings.Contains(line, "unable to get git ref:") ||
+		strings.Contains(line, "unable to get git revision:")
 }
