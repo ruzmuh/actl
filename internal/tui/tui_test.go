@@ -49,7 +49,7 @@ func TestModelFlow(t *testing.T) {
 
 	// toggle the env pane (no live run, so it shows the paused-only hint)
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
-	if got := m.View(); !strings.Contains(got, "ENV (job-scoped)") {
+	if got := m.View(); !strings.Contains(got, "job env at step 1") {
 		t.Errorf("env pane not shown after toggle:\n%s", got)
 	}
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")}) // toggle back

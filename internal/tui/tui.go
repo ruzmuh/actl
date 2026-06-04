@@ -210,6 +210,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cur = msg.Index
 		m.curAt = msg.When
 		m.curErr = msg.Err
+		m.cursor = msg.Index // focus the step we stopped at; edit/env/rerun target it
 		return m, nil
 
 	case logMsg:
@@ -290,7 +291,11 @@ func (m Model) View() string {
 
 	// bottom pane: env (while inspecting) or log tail
 	if m.showEnv {
-		b.WriteString(paneStyle.Width(m.paneWidth()).Render("ENV (job-scoped)\n"+m.envPane()) + "\n")
+		title := "ENV · job-scoped"
+		if m.cur >= 0 {
+			title = fmt.Sprintf("ENV · job env at step %d %q", m.cur+1, m.stepLabel(m.cur))
+		}
+		b.WriteString(paneStyle.Width(m.paneWidth()).Render(title+"\n"+m.envPane()) + "\n")
 	} else {
 		b.WriteString(paneStyle.Width(m.paneWidth()).Render("LOGS\n"+m.logTail()) + "\n")
 	}
@@ -377,6 +382,13 @@ func (m *Model) applyEdit(msg editDoneMsg) {
 	}
 }
 
+func (m Model) stepLabel(i int) string {
+	if i >= 0 && i < len(m.labels) {
+		return m.labels[i]
+	}
+	return ""
+}
+
 // envText renders the current job env as editable KEY=VALUE lines.
 func (m Model) envText() string {
 	env := m.sess.Env()
@@ -448,7 +460,7 @@ func (m Model) logHeight() int {
 func (m Model) statusLine() string {
 	switch m.state {
 	case statePaused:
-		where := fmt.Sprintf("%s step %d", m.curAt.String(), m.cur+1)
+		where := fmt.Sprintf("%s step %d: %s", m.curAt.String(), m.cur+1, m.stepLabel(m.cur))
 		if m.curErr != nil {
 			where += errStyle.Render(" — step failed: "+m.curErr.Error())
 		}
