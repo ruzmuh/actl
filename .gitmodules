@@ -1,0 +1,4 @@
+[submodule "third_party/act"]
+	path = third_party/act
+	url = https://github.com/ruzmuh/act
+	branch = actl

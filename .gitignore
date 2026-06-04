@@ -1,0 +1,19 @@
+# build output
+/dist/
+/actl
+*.test
+
+# local dev workspace (editor convenience; the build resolves act via the
+# replace directive in go.mod, so CI does not need this)
+/go.work
+/go.work.sum
+
+# secrets loaded by actl
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

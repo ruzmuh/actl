@@ -1,0 +1,16 @@
+name: sample
+on: push
+
+env:
+  GREETING: hello
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GREETING: hello
+    steps:
+      - name: first
+        run: echo "step one"
+      - name: second
+        run: echo "step two -- pause between us is the whole point"
