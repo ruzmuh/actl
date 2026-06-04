@@ -34,6 +34,13 @@ func TestModelFlow(t *testing.T) {
 		t.Errorf("paused view wrong:\n%s", got)
 	}
 
+	// run-to-cursor while the cursor sits on the paused step is a no-op guard
+	// (cursor==cur, Before) — it must not resume the run (no act goroutine here).
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	if got := m.View(); !strings.Contains(got, "already stopped before this step") {
+		t.Errorf("run-to-cursor guard not hit:\n%s", got)
+	}
+
 	// some output
 	m, _ = m.Update(logMsg("hello from a step"))
 	if got := m.View(); !strings.Contains(got, "hello from a step") {

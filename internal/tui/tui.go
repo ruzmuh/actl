@@ -68,6 +68,7 @@ type Model struct {
 
 	cursor      int          // selected step, for arming breakpoints
 	breakpoints map[int]bool // mirror of the core's breakpoints, for rendering
+	tempBreak   int          // one-shot breakpoint armed by run-to-cursor (-1 = none)
 
 	width, height int
 }
@@ -86,6 +87,7 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 		state:       stateRunning,
 		cur:         -1,
 		breakpoints: make(map[int]bool),
+		tempBreak:   -1,
 	}
 }
 
@@ -150,6 +152,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateRunning
 				return m, m.waitPause
 			}
+		case "g":
+			if m.state == statePaused {
+				return m.runToCursor()
+			}
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -206,6 +212,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case pauseMsg:
+		// A run-to-cursor temp breakpoint is one-shot: any pause consumes it.
+		// Restore the core to the user's own breakpoint state at that index.
+		if m.tempBreak >= 0 {
+			m.sess.SetBreakpoint(m.tempBreak, m.breakpoints[m.tempBreak])
+			m.tempBreak = -1
+		}
 		m.state = statePaused
 		m.cur = msg.Index
 		m.curAt = msg.When
@@ -320,6 +332,32 @@ func (m Model) shellCmd(name string) *exec.Cmd {
 	}
 	args = append(args, name, "sh", "-c", "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh")
 	return exec.Command("docker", args...)
+}
+
+// runToCursor resumes and halts before the step under the cursor, using a
+// one-shot breakpoint cleared on the next pause (gdb's `advance`). It only runs
+// forward: the cursor must be ahead of the current execution point, since act
+// can't replay a before-barrier it has already passed (use reload to restart).
+func (m Model) runToCursor() (tea.Model, tea.Cmd) {
+	target := m.cursor
+	switch {
+	case target == m.cur && m.curAt == debugger.Before:
+		m.logs = append(m.logs, "run-to-cursor: already stopped before this step")
+		return m, nil
+	case target <= m.cur:
+		m.logs = append(m.logs, "run-to-cursor: target is behind the current step — can't run backward")
+		return m, nil
+	}
+	// Arm a temp breakpoint unless the user already has a real one there (which
+	// we must not clobber when the pause clears it).
+	if !m.breakpoints[target] {
+		m.tempBreak = target
+		m.sess.SetBreakpoint(target, true)
+	}
+	m.logs = append(m.logs, fmt.Sprintf("running to step %d: %s", target+1, m.stepLabel(target)))
+	m.sess.Continue()
+	m.state = stateRunning
+	return m, m.waitPause
 }
 
 // rerunCmd re-executes the paused step in the live container (picking up edits).
@@ -465,7 +503,7 @@ func (m Model) statusLine() string {
 			where += errStyle.Render(" — step failed: "+m.curErr.Error())
 		}
 		return statusStyle.Render("⏸  paused "+where) +
-			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · i edit-cmd · E edit-env · r rerun · e env · d shell · q quit")
+			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · g to-cursor · i edit-cmd · E edit-env · r rerun · e env · d shell · q quit")
 	case stateRunning:
 		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  ↑↓ nav · b break · q quit")
 	default:
