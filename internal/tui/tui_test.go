@@ -54,6 +54,20 @@ func TestModelFlow(t *testing.T) {
 	}
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")}) // toggle back
 
+	// env edit parsing (SetEnv is a no-op while not paused, but parsing must work)
+	if mm, ok := m.(Model); ok {
+		mm.applyEdit(editDoneMsg{kind: editEnv, content: "FOO=bar\n# a comment\nBAZ=qux\n"})
+		found := false
+		for _, l := range mm.logs {
+			if strings.Contains(l, "applied 2 env var(s)") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("env edit not parsed into 2 vars: %v", mm.logs)
+		}
+	}
+
 	// completion
 	m, _ = m.Update(doneMsg{})
 	if got := m.View(); !strings.Contains(got, "run complete") {

@@ -81,21 +81,34 @@ func run(workflowPath, event, image string, breaks []int) error {
 			fmt.Printf("\n⏸️  %-6s step %d: %q%s\n", ev.When, ev.Index+1, ev.Step.String(), outcome(ev))
 			fmt.Printf("   container=%s  env=%d vars  (e.g. CI=%q)\n",
 				sess.ContainerName(), len(sess.Env()), sess.Env()["CI"])
-			fmt.Print("   > ")
-			cmd := ""
-			if stdin.Scan() {
-				cmd = strings.TrimSpace(stdin.Text())
-			}
-			switch cmd {
-			case "c":
-				fmt.Println("▶️  continue")
-				sess.Continue()
-			case "q":
-				fmt.Println("⏹️  abort")
-				sess.Abort()
-			default:
-				fmt.Println("▶️  step")
-				sess.Step()
+		resumeLoop:
+			for {
+				fmt.Print("   > (enter=step c=continue x=edit+rerun q=quit) ")
+				cmd := ""
+				if stdin.Scan() {
+					cmd = strings.TrimSpace(stdin.Text())
+				}
+				switch cmd {
+				case "c":
+					fmt.Println("▶️  continue")
+					sess.Continue()
+					break resumeLoop
+				case "q":
+					fmt.Println("⏹️  abort")
+					sess.Abort()
+					break resumeLoop
+				case "x":
+					fmt.Println("✏️  edit run -> 'echo EDITED-RERUN-OK', rerun")
+					sess.SetRun("echo EDITED-RERUN-OK")
+					if err := sess.Rerun(); err != nil {
+						fmt.Println("   rerun error:", err)
+					}
+					// stay paused; prompt again
+				default:
+					fmt.Println("▶️  step")
+					sess.Step()
+					break resumeLoop
+				}
 			}
 		case <-sess.Done():
 			if err := sess.Err(); err != nil {

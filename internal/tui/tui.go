@@ -8,6 +8,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -33,6 +34,19 @@ type (
 	logsDoneMsg  struct{}
 	doneMsg      struct{ err error }
 	shellDoneMsg struct{ err error }
+	rerunDoneMsg struct{ err error }
+	editDoneMsg  struct {
+		kind    editKind
+		content string
+		err     error
+	}
+)
+
+type editKind int
+
+const (
+	editRun editKind = iota // the step's run: script
+	editEnv                 // the job env (KEY=VALUE lines)
 )
 
 // Model is the actl TUI state.
@@ -158,6 +172,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			m.showEnv = !m.showEnv
 			return m, nil
+		case "i":
+			if m.state == statePaused {
+				if m.sess.CurrentRun() == "" {
+					m.logs = append(m.logs, "edit: only run: steps have a command to edit")
+					return m, nil
+				}
+				return m, m.editCmd(editRun, m.sess.CurrentRun())
+			}
+		case "E":
+			if m.state == statePaused {
+				return m, m.editCmd(editEnv, m.envText())
+			}
+		case "r":
+			if m.state == statePaused {
+				if !m.sess.CanRerun() {
+					m.logs = append(m.logs, "rerun: available only after a step has run (step onto it first)")
+					return m, nil
+				}
+				m.logs = append(m.logs, fmt.Sprintf("re-running step %d…", m.cur+1))
+				return m, m.rerunCmd()
+			}
 		case "d":
 			if m.state == statePaused {
 				if name := m.sess.ContainerName(); name != "" {
@@ -191,6 +226,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.logs = append(m.logs, "shell: "+msg.err.Error())
 		}
+		return m, nil
+
+	case rerunDoneMsg:
+		if msg.err != nil {
+			m.logs = append(m.logs, "rerun: "+msg.err.Error())
+		}
+		return m, nil
+
+	case editDoneMsg:
+		m.applyEdit(msg)
 		return m, nil
 
 	case doneMsg:
@@ -272,6 +317,82 @@ func (m Model) shellCmd(name string) *exec.Cmd {
 	return exec.Command("docker", args...)
 }
 
+// rerunCmd re-executes the paused step in the live container (picking up edits).
+func (m Model) rerunCmd() tea.Cmd {
+	return func() tea.Msg { return rerunDoneMsg{err: m.sess.Rerun()} }
+}
+
+// editCmd hands the terminal to $EDITOR on a temp file seeded with initial, then
+// returns the edited content. Like the shell, editing is the frontend's job —
+// the core only applies the result (CLAUDE.md §5).
+func (m Model) editCmd(kind editKind, initial string) tea.Cmd {
+	ext := ".sh"
+	if kind == editEnv {
+		ext = ".env"
+	}
+	f, err := os.CreateTemp("", "actl-edit-*"+ext)
+	if err != nil {
+		return func() tea.Msg { return editDoneMsg{kind: kind, err: err} }
+	}
+	_, _ = f.WriteString(initial)
+	_ = f.Close()
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	c := exec.Command(editor, f.Name()) //nolint:gosec // editor is the user's own $EDITOR
+	return tea.ExecProcess(c, func(runErr error) tea.Msg {
+		defer os.Remove(f.Name())
+		if runErr != nil {
+			return editDoneMsg{kind: kind, err: runErr}
+		}
+		b, rerr := os.ReadFile(f.Name())
+		return editDoneMsg{kind: kind, content: string(b), err: rerr}
+	})
+}
+
+func (m *Model) applyEdit(msg editDoneMsg) {
+	if msg.err != nil {
+		m.logs = append(m.logs, "edit: "+msg.err.Error())
+		return
+	}
+	switch msg.kind {
+	case editRun:
+		m.sess.SetRun(strings.TrimRight(msg.content, "\n"))
+		m.logs = append(m.logs, "edited step command (in memory) — press r to rerun")
+	case editEnv:
+		n := 0
+		for _, line := range strings.Split(msg.content, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if k, v, ok := strings.Cut(line, "="); ok {
+				m.sess.SetEnv(strings.TrimSpace(k), v)
+				n++
+			}
+		}
+		m.logs = append(m.logs, fmt.Sprintf("applied %d env var(s) (in memory) — press r to rerun", n))
+	}
+}
+
+// envText renders the current job env as editable KEY=VALUE lines.
+func (m Model) envText() string {
+	env := m.sess.Env()
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("# edit job env — KEY=VALUE per line; '#' comments ignored\n")
+	for _, k := range keys {
+		b.WriteString(k + "=" + env[k] + "\n")
+	}
+	return b.String()
+}
+
 func (m Model) envPane() string {
 	env := m.sess.Env()
 	if len(env) == 0 {
@@ -331,9 +452,10 @@ func (m Model) statusLine() string {
 		if m.curErr != nil {
 			where += errStyle.Render(" — step failed: "+m.curErr.Error())
 		}
-		return statusStyle.Render("⏸  paused "+where) + dimStyle.Render("   ·  [↑↓]move  [b]reak  [s]tep  [c]ontinue  [e]nv  [d]shell  [q]uit")
+		return statusStyle.Render("⏸  paused "+where) +
+			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · i edit-cmd · E edit-env · r rerun · e env · d shell · q quit")
 	case stateRunning:
-		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  [↑↓]move  [b]reak  [q]uit")
+		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  ↑↓ nav · b break · q quit")
 	default:
 		if m.runErr != nil {
 			return errStyle.Render("✖  run failed: "+m.runErr.Error()) + dimStyle.Render("   ·  [q]uit")

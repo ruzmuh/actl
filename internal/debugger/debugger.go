@@ -95,6 +95,10 @@ type Session struct {
 	breakOnErr   bool
 	curEnv       map[string]string // live env at the current pause (nil while running)
 	curContainer string            // job container name at the current pause
+	curStep      *model.Step       // live step at the current pause (for editing)
+	curWhen      When              // boundary of the current pause
+	curRerun     func(context.Context) error
+	curCtx       context.Context //nolint:containedctx // the barrier's exec ctx, used only to re-run a step while paused; cleared on resume
 
 	err error // run result, valid once Done is closed
 }
@@ -259,6 +263,10 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 	s.mu.Lock()
 	s.curEnv = info.Env
 	s.curContainer = info.ContainerName
+	s.curStep = info.Step
+	s.curWhen = toWhen(info.When)
+	s.curRerun = info.Rerun
+	s.curCtx = ctx
 	s.mu.Unlock()
 
 	ev := PauseEvent{When: toWhen(info.When), Index: info.Index, Step: info.Step, Err: info.Err}
@@ -274,6 +282,9 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 		s.curMode = c.mode
 		s.curEnv = nil
 		s.curContainer = ""
+		s.curStep = nil
+		s.curRerun = nil
+		s.curCtx = nil
 		s.mu.Unlock()
 		if c.abort {
 			return ErrAborted
@@ -306,6 +317,61 @@ func (s *Session) ContainerName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.curContainer
+}
+
+// CurrentRun returns the paused step's `run:` script (empty for a `uses:` step
+// or while running) — for pre-filling an editor before Rerun.
+func (s *Session) CurrentRun() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.curStep == nil {
+		return ""
+	}
+	return s.curStep.Run
+}
+
+// SetRun replaces the paused step's `run:` script in memory (the file on disk is
+// untouched). The next Rerun picks it up. No-op while running.
+func (s *Session) SetRun(script string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.curStep != nil {
+		s.curStep.Run = script
+	}
+}
+
+// SetEnv sets or overrides a job env var in memory. The next Rerun (and later
+// steps) see it. No-op while running.
+func (s *Session) SetEnv(key, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.curEnv != nil {
+		s.curEnv[key] = value
+	}
+}
+
+// CanRerun reports whether Rerun is available — only after a step's main has run
+// (rerunning before it would double-execute on resume).
+func (s *Session) CanRerun() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.curRerun != nil && s.curWhen == After
+}
+
+// Rerun re-executes the paused step's main in the live container, picking up any
+// SetRun/SetEnv edits. It blocks until the step finishes; output arrives on
+// Logs(). Only valid while paused after a step has run.
+func (s *Session) Rerun() error {
+	s.mu.Lock()
+	rerun, rctx, when := s.curRerun, s.curCtx, s.curWhen
+	s.mu.Unlock()
+	if rerun == nil {
+		return errors.New("debugger: not paused")
+	}
+	if when != After {
+		return errors.New("debugger: rerun is available only after a step has run (step onto it first)")
+	}
+	return rerun(rctx)
 }
 
 // shouldHalt is the halt/pass policy. Step mode halts everywhere; Continue mode
