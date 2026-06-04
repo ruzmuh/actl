@@ -52,6 +52,9 @@ type Model struct {
 	runErr  error
 	showEnv bool // env pane instead of log pane
 
+	cursor      int          // selected step, for arming breakpoints
+	breakpoints map[int]bool // mirror of the core's breakpoints, for rendering
+
 	width, height int
 }
 
@@ -62,12 +65,13 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 		labels = append(labels, st.String())
 	}
 	return Model{
-		sess:   sess,
-		cancel: cancel,
-		title:  fmt.Sprintf("job %q", sess.JobID()),
-		labels: labels,
-		state:  stateRunning,
-		cur:    -1,
+		sess:        sess,
+		cancel:      cancel,
+		title:       fmt.Sprintf("job %q", sess.JobID()),
+		labels:      labels,
+		state:       stateRunning,
+		cur:         -1,
+		breakpoints: make(map[int]bool),
 	}
 }
 
@@ -132,6 +136,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateRunning
 				return m, m.waitPause
 			}
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+			return m, nil
+		case "down", "j":
+			if m.cursor < len(m.labels)-1 {
+				m.cursor++
+			}
+			return m, nil
+		case "b":
+			on := !m.breakpoints[m.cursor]
+			if on {
+				m.breakpoints[m.cursor] = true
+			} else {
+				delete(m.breakpoints, m.cursor)
+			}
+			m.sess.SetBreakpoint(m.cursor, on) // safe any time; consulted in Continue mode
+			return m, nil
 		case "e":
 			m.showEnv = !m.showEnv
 			return m, nil
@@ -188,6 +211,7 @@ var (
 	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	keyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	bpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	statusStyle = lipgloss.NewStyle().Bold(true)
 )
 
@@ -195,22 +219,27 @@ func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("actl · "+m.title) + "\n\n")
 
-	// step list
+	// step list: [breakpoint] [cursor] N. label (state)
 	var steps strings.Builder
 	for i, label := range m.labels {
-		marker := "  "
-		line := fmt.Sprintf("%d. %s", i+1, label)
+		bp := "  "
+		if m.breakpoints[i] {
+			bp = bpStyle.Render(" ●")
+		}
+		caret := "  "
+		if i == m.cursor {
+			caret = "❯ "
+		}
+		text := fmt.Sprintf("%d. %s", i+1, label)
 		switch {
 		case i == m.cur && m.state == statePaused:
-			marker = curStyle.Render("▶ ")
-			line = curStyle.Render(line) + dimStyle.Render("  ("+m.curAt.String()+")")
+			text = curStyle.Render(text) + dimStyle.Render("  ("+m.curAt.String()+")")
 		case i == m.cur && m.state == stateRunning:
-			marker = "● "
-			line = line + dimStyle.Render("  (running)")
+			text = text + dimStyle.Render("  (running)")
 		case i < m.cur || (i == m.cur && m.state == stateFinished):
-			line = dimStyle.Render(line)
+			text = dimStyle.Render(text)
 		}
-		steps.WriteString(marker + line + "\n")
+		steps.WriteString(bp + caret + text + "\n")
 	}
 	b.WriteString(paneStyle.Width(m.paneWidth()).Render("STEPS\n"+strings.TrimRight(steps.String(), "\n")) + "\n")
 
@@ -302,9 +331,9 @@ func (m Model) statusLine() string {
 		if m.curErr != nil {
 			where += errStyle.Render(" — step failed: "+m.curErr.Error())
 		}
-		return statusStyle.Render("⏸  paused "+where) + dimStyle.Render("   ·  [s]tep  [c]ontinue  [e]nv  [d]shell  [q]uit")
+		return statusStyle.Render("⏸  paused "+where) + dimStyle.Render("   ·  [↑↓]move  [b]reak  [s]tep  [c]ontinue  [e]nv  [d]shell  [q]uit")
 	case stateRunning:
-		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  [q]uit")
+		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  [↑↓]move  [b]reak  [q]uit")
 	default:
 		if m.runErr != nil {
 			return errStyle.Render("✖  run failed: "+m.runErr.Error()) + dimStyle.Render("   ·  [q]uit")

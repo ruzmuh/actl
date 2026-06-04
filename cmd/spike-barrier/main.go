@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/ruzmuh/actl/internal/debugger"
@@ -27,20 +28,32 @@ func main() {
 	workflowPath := flag.String("workflow", "testdata/workflows/sample.yml", "path to the workflow file")
 	event := flag.String("event", "push", "event name to plan for")
 	image := flag.String("image", "catthehacker/ubuntu:act-latest", "docker image for ubuntu-latest (first run pulls it)")
+	breaks := flag.String("break", "", "comma-separated zero-based step indices to break before (Continue mode)")
 	flag.Parse()
 
-	if err := run(*workflowPath, *event, *image); err != nil {
+	if err := run(*workflowPath, *event, *image, parseBreaks(*breaks)); err != nil {
 		fmt.Fprintln(os.Stderr, "spike-barrier:", err)
 		os.Exit(1)
 	}
 }
 
-func run(workflowPath, event, image string) error {
+func parseBreaks(s string) []int {
+	var out []int
+	for _, f := range strings.Split(s, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(f)); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func run(workflowPath, event, image string, breaks []int) error {
 	sess, err := debugger.New(debugger.Options{
 		WorkflowPath: workflowPath,
 		EventName:    event,
 		Image:        image,
 		BreakOnError: true,
+		Breakpoints:  breaks,
 	})
 	if err != nil {
 		return err

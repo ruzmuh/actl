@@ -40,6 +40,13 @@ func TestModelFlow(t *testing.T) {
 		t.Errorf("log line not rendered:\n%s", got)
 	}
 
+	// move the cursor and arm a breakpoint; the dot should render
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if got := m.View(); !strings.Contains(got, "●") {
+		t.Errorf("breakpoint dot not rendered after toggle:\n%s", got)
+	}
+
 	// toggle the env pane (no live run, so it shows the paused-only hint)
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 	if got := m.View(); !strings.Contains(got, "ENV (job-scoped)") {

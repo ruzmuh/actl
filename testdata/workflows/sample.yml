@@ -10,7 +10,17 @@ jobs:
     env:
       GREETING: hello
     steps:
-      - name: first
-        run: echo "step one"
-      - name: second
-        run: echo "step two -- pause between us is the whole point"
+      - name: greet
+        run: echo "$GREETING from step one"
+      - name: set stage
+        run: echo "STAGE=build" >> "$GITHUB_ENV"
+      - name: show stage
+        run: echo "stage is now '$STAGE'"
+      - name: compute version
+        run: echo "VERSION=1.2.3" >> "$GITHUB_ENV"
+      - name: build
+        run: echo "building $VERSION at stage $STAGE"
+      - name: linger
+        run: |
+          echo "a step worth pausing on -- set a breakpoint here"
+          echo "done"

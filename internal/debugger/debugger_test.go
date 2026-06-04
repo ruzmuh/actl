@@ -24,11 +24,11 @@ func TestNew(t *testing.T) {
 	if s.JobID() != "build" {
 		t.Errorf("JobID = %q, want %q", s.JobID(), "build")
 	}
-	if n := len(s.Steps()); n != 2 {
-		t.Fatalf("len(Steps) = %d, want 2", n)
+	if n := len(s.Steps()); n != 6 {
+		t.Fatalf("len(Steps) = %d, want 6", n)
 	}
-	if got := s.Steps()[0].String(); got != "first" {
-		t.Errorf("step 1 = %q, want %q", got, "first")
+	if got := s.Steps()[0].String(); got != "greet" {
+		t.Errorf("step 1 = %q, want %q", got, "greet")
 	}
 }
 
