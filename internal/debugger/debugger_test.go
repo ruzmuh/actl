@@ -2,6 +2,8 @@ package debugger
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/nektos/act/pkg/runner"
@@ -45,9 +47,109 @@ func TestInspectionNilWhileRunning(t *testing.T) {
 	}
 }
 
-func TestSingleJobOnly(t *testing.T) {
-	if _, err := New(Options{WorkflowPath: "testdata/two-jobs.yml", Workdir: t.TempDir()}); err == nil {
-		t.Fatal("expected an error for a multi-job workflow, got nil")
+func TestSelectJob(t *testing.T) {
+	const wf = "testdata/two-jobs.yml"
+
+	// no JobID + multiple jobs -> MultipleJobsError listing the choices
+	_, err := New(Options{WorkflowPath: wf, Workdir: t.TempDir()})
+	var multi *MultipleJobsError
+	if !errors.As(err, &multi) {
+		t.Fatalf("want MultipleJobsError, got %v", err)
+	}
+	if got := multi.Jobs; len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("MultipleJobsError.Jobs = %v, want [a b]", got)
+	}
+
+	// explicit job -> that job
+	s, err := New(Options{WorkflowPath: wf, JobID: "b", Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.JobID() != "b" {
+		t.Errorf("JobID = %q, want %q", s.JobID(), "b")
+	}
+
+	// unknown job -> plain error, not MultipleJobsError
+	_, err = New(Options{WorkflowPath: wf, JobID: "nope", Workdir: t.TempDir()})
+	if err == nil || errors.As(err, &multi) {
+		t.Errorf("want a plain not-found error, got %v", err)
+	}
+}
+
+// TestIsolatedPlan guards against re-executing the whole dependency graph: the
+// session must run only the selected job's run, even when it has needs.
+func TestIsolatedPlan(t *testing.T) {
+	s, err := New(Options{WorkflowPath: "../../testdata/workflows/pipeline.yml", JobID: "deploy", Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.plan.Stages) != 1 || len(s.plan.Stages[0].Runs) != 1 {
+		t.Fatalf("plan should hold exactly one run, got stages=%d", len(s.plan.Stages))
+	}
+	if got := s.plan.Stages[0].Runs[0].JobID; got != "deploy" {
+		t.Errorf("isolated run = %q, want deploy", got)
+	}
+}
+
+// TestSeedNeeds verifies isolated-run needs seeding: outputs are replaced by only
+// the supplied keys (so unseeded ones resolve empty, like GitHub), and the result
+// defaults to success unless overridden.
+func TestSeedNeeds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wf.yml")
+	const wf = `name: t
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.x.outputs.image }}
+      tag: ${{ steps.x.outputs.tag }}
+    steps:
+      - id: x
+        run: echo hi
+  b:
+    runs-on: ubuntu-latest
+    needs: a
+    steps:
+      - run: echo ${{ needs.a.outputs.image }}
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// seed one output; leave result to default, leave 'tag' unseeded
+	s, err := New(Options{
+		WorkflowPath: path,
+		JobID:        "b",
+		Workdir:      t.TempDir(),
+		Needs:        map[string]NeedsInput{"a": {Outputs: map[string]string{"image": "bar"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := s.NeedsSummary()
+	if len(sum) != 1 || sum[0].Job != "a" {
+		t.Fatalf("NeedsSummary = %+v, want one entry for job a", sum)
+	}
+	if !sum[0].Assumed || sum[0].Result != "success" {
+		t.Errorf("result = %q assumed=%v, want success assumed", sum[0].Result, sum[0].Assumed)
+	}
+	if got := sum[0].Outputs; len(got) != 1 || got["image"] != "bar" {
+		t.Errorf("outputs = %v, want only {image:bar} (unseeded 'tag' dropped)", got)
+	}
+
+	// overriding the result clears the assumed flag
+	s2, err := New(Options{
+		WorkflowPath: path,
+		JobID:        "b",
+		Workdir:      t.TempDir(),
+		Needs:        map[string]NeedsInput{"a": {Result: "failure"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum := s2.NeedsSummary(); sum[0].Assumed || sum[0].Result != "failure" {
+		t.Errorf("override result = %q assumed=%v, want failure not-assumed", sum[0].Result, sum[0].Assumed)
 	}
 }
 

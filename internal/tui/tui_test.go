@@ -9,6 +9,27 @@ import (
 	"github.com/ruzmuh/actl/internal/debugger"
 )
 
+// TestNeedsLines locks the isolated-run transparency text: seeded outputs are
+// listed sorted, an assumed result is marked, and no outputs reads as empty.
+func TestNeedsLines(t *testing.T) {
+	lines := needsLines([]debugger.NeedsSummary{
+		{Job: "build", Result: "success", Assumed: true, Outputs: map[string]string{"image": "repo/app:abc", "version": "1.4.2"}},
+		{Job: "test", Result: "failure", Assumed: false},
+	})
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d: %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], `needs "build"`) ||
+		!strings.Contains(lines[0], "result=success (assumed)") ||
+		!strings.Contains(lines[0], "image=repo/app:abc, version=1.4.2") {
+		t.Errorf("build line wrong: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "result=failure") || strings.Contains(lines[1], "assumed") ||
+		!strings.Contains(lines[1], "none") {
+		t.Errorf("test line wrong: %q", lines[1])
+	}
+}
+
 // TestModelFlow drives the model through synthetic core messages and checks the
 // rendered status — no Docker, no TTY. It guards the pause/step/continue wiring
 // and that View never panics.

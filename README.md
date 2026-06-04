@@ -5,8 +5,13 @@ locally — pause before any step, inspect the environment, drop into the job co
 re-run a step — with **faithful `uses:` execution**, because it stands on
 [`nektos/act`](https://github.com/nektos/act) instead of reimplementing the Actions engine.
 
-> Status: pre-v0.1, under active scaffolding. Go. MIT. FOSS, no monetization.
+> Status: pre-v0.1, under active development. Go. MIT. FOSS, no monetization.
 > See [CLAUDE.md](./CLAUDE.md) for the full design.
+>
+> Working today: single-job debugging through act's real engine — pause before/after
+> every step, env inspector, drop into the live job container, edit a step's command or
+> env and re-run it in place, breakpoints + run-to-cursor, job selection, and isolated-run
+> `needs` seeding with a transparency line.
 
 ## Why
 
@@ -53,15 +58,42 @@ go run ./cmd/actl path/to/workflow.yml     # your own workflow
 go run ./cmd/actl -image node:20-bullseye-slim   # smaller image for quick run-only workflows
 ```
 
-In the TUI: `s` step · `c` continue · `q` quit. The run halts before the first step;
-break-on-error halts after a failing step. `go test ./internal/...` runs the core/TUI tests
-(no Docker needed).
+### TUI keys
+
+When paused: `s`/`enter` step · `c` continue · `g` run-to-cursor · `↑↓`/`jk` move cursor ·
+`b` toggle breakpoint · `e` env pane · `i` edit step command · `E` edit job env ·
+`r` re-run the step in the live container · `d` drop into a shell in the container · `q` quit.
+The run halts before the first step; break-on-error halts after a failing step.
+
+### Selecting a job & seeding `needs`
+
+`actl` debugs one job at a time, in isolation — the job's upstream `needs` jobs are **not**
+run. Pick the job, and seed the upstream outputs/results you want it to see; the same flags
+on the command line mean a re-run reproduces the exact state.
+
+```sh
+go run ./cmd/actl testdata/workflows/pipeline.yml        # lists jobs if there's more than one
+go run ./cmd/actl -job deploy testdata/workflows/pipeline.yml
+
+# seed what the upstream job would have produced (paths mirror the needs.* context):
+go run ./cmd/actl -job deploy \
+  -need 'build.outputs.image=ghcr.io/acme/app:1.4.2' \
+  -need 'build.result=success' \
+  -env  'STAGE=prod' \
+  testdata/workflows/pipeline.yml
+```
+
+Unseeded outputs resolve to empty (exactly as a non-existent output does in GitHub); an
+unseeded `result` defaults to `success`. The TUI prints a transparency line per need so you
+see precisely what the isolated run stands on. `go test ./...` runs the tests (no Docker needed).
 
 ## Roadmap
 
-See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md). In short:
-library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → minimal TUI ✓ →
-`uses:` verification → ambient identity substitution → upstream the hook.
+See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md). Done so far:
+library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI (step/inspect/shell/
+edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓.
+Next: run-dependencies-then-debug (`--with-deps`) → full multi-job graph → ambient identity
+substitution → `uses:` verification → upstream the hook.
 
 ## License
 

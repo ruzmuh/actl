@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/nektos/act/pkg/common"
@@ -26,16 +28,45 @@ import (
 // ErrAborted is the run error when the front-end aborts via Abort.
 var ErrAborted = errors.New("debugger: run aborted by user")
 
+// MultipleJobsError is returned by New when the workflow has more than one job
+// and Options.JobID did not pick one. It lists the available job ids so a
+// frontend can prompt for a choice.
+type MultipleJobsError struct{ Jobs []string }
+
+func (e *MultipleJobsError) Error() string {
+	return fmt.Sprintf("workflow has %d jobs; select one with -job: %s", len(e.Jobs), strings.Join(e.Jobs, ", "))
+}
+
+// NeedsInput seeds an upstream job's contribution to the needs context when a
+// downstream job is debugged in isolation (the upstream job is not run). Outputs
+// holds only the keys the user provided; Result defaults to "success" if empty.
+type NeedsInput struct {
+	Outputs map[string]string
+	Result  string
+}
+
+// NeedsSummary describes how one of the selected job's needs was satisfied
+// locally, for a transparency line. Result is the effective value; Assumed is
+// true when it was defaulted rather than supplied.
+type NeedsSummary struct {
+	Job     string
+	Result  string
+	Assumed bool
+	Outputs map[string]string
+}
+
 // Options configures a debug Session. Only WorkflowPath is required.
 type Options struct {
-	WorkflowPath string            // path to the workflow file
-	EventName    string            // event to plan for (default "push")
-	Image        string            // docker image mapped to ubuntu-latest (default catthehacker)
-	Workdir      string            // job workdir; a temp dir is created and cleaned up if empty
-	Secrets      map[string]string // secrets exposed to the workflow
-	Env          map[string]string // extra env for containers
-	BreakOnError bool              // in Continue mode, halt after a step that errored
-	Breakpoints  []int             // zero-based step indices to halt before, in Continue mode
+	WorkflowPath string                // path to the workflow file
+	EventName    string                // event to plan for (default "push")
+	JobID        string                // which job to debug; required only if the event plans more than one
+	Image        string                // docker image mapped to ubuntu-latest (default catthehacker)
+	Workdir      string                // job workdir; a temp dir is created and cleaned up if empty
+	Secrets      map[string]string     // secrets exposed to the workflow
+	Env          map[string]string     // extra env for containers
+	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id
+	BreakOnError bool                  // in Continue mode, halt after a step that errored
+	Breakpoints  []int                 // zero-based step indices to halt before, in Continue mode
 }
 
 // When marks which side of a step's main executor a pause occurred on. It mirrors
@@ -77,11 +108,12 @@ type control struct {
 
 // Session is one debug run of a single job. Construct with New, then Start.
 type Session struct {
-	jobID   string
-	steps   []*model.Step
-	runner  runner.Runner
-	plan    *model.Plan
-	tmpDir  string // non-empty if we created (and must clean up) the workdir
+	jobID  string
+	steps  []*model.Step
+	needs  []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
+	runner runner.Runner
+	plan   *model.Plan
+	tmpDir string // non-empty if we created (and must clean up) the workdir
 
 	pauses  chan PauseEvent
 	resume  chan control
@@ -103,8 +135,10 @@ type Session struct {
 	err error // run result, valid once Done is closed
 }
 
-// New parses the workflow, builds a single-job plan, and wires the pause barrier.
-// It does not start execution; call Start. v0.1 supports exactly one job.
+// New parses the workflow, plans the chosen job, and wires the pause barrier. It
+// does not start execution; call Start. v0.1 debugs a single job: if the event
+// plans more than one, Options.JobID must pick one (else a MultipleJobsError
+// lists the choices).
 func New(opts Options) (*Session, error) {
 	if opts.WorkflowPath == "" {
 		return nil, errors.New("debugger: WorkflowPath is required")
@@ -124,10 +158,24 @@ func New(opts Options) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("debugger: plan event %q: %w", opts.EventName, err)
 	}
-	run, err := singleRun(plan)
+	run, err := selectRun(plan, opts.JobID)
 	if err != nil {
 		return nil, err
 	}
+
+	// Execute ONLY the selected job. act's planners expand the dependency
+	// closure (PlanEvent plans every job; even PlanJob pulls in job.Needs()
+	// transitively via createStages), and NewPlanExecutor runs the whole plan —
+	// so we must hand it a plan holding just this one run, or its upstream jobs
+	// run too. Isolation is the v0.1 contract.
+	isolated := &model.Plan{Stages: []*model.Stage{{Runs: []*model.Run{run}}}}
+
+	// In isolation the upstream jobs never run, so seed the needs context the
+	// downstream job reads (act resolves needs.<job>.* straight from the workflow
+	// model). Unseeded outputs are simply absent → empty, exactly as GitHub
+	// resolves a non-existent output; the result defaults to success so typical
+	// `if: needs.x.result == 'success'` gates don't skip the whole job.
+	needs := seedNeeds(run, opts.Needs)
 
 	workdir := opts.Workdir
 	var tmpDir string
@@ -149,7 +197,8 @@ func New(opts Options) (*Session, error) {
 	s := &Session{
 		jobID:       run.JobID,
 		steps:       run.Job().Steps,
-		plan:        plan,
+		needs:       needs,
+		plan:        isolated,
 		tmpDir:      tmpDir,
 		pauses:      make(chan PauseEvent),
 		resume:      make(chan control),
@@ -188,6 +237,10 @@ func (s *Session) JobID() string { return s.jobID }
 // Steps returns the job's steps in declaration order (for rendering a step list
 // before the run starts).
 func (s *Session) Steps() []*model.Step { return s.steps }
+
+// NeedsSummary reports how the selected job's needs were satisfied in isolation,
+// for a transparency line. Empty when the job has no needs.
+func (s *Session) NeedsSummary() []NeedsSummary { return s.needs }
 
 // Start launches the run in the background. The run halts at the first barrier
 // (before the first step) per the default Step mode; drive it via the control
@@ -398,19 +451,72 @@ func (s *Session) cleanup() {
 	}
 }
 
-func singleRun(plan *model.Plan) (*model.Run, error) {
+// selectRun picks the single job to debug. With jobID set it returns that job
+// (or an error naming the available ones); without it, it returns the sole job,
+// or a MultipleJobsError so a frontend can prompt.
+func selectRun(plan *model.Plan, jobID string) (*model.Run, error) {
 	var runs []*model.Run
 	for _, stage := range plan.Stages {
 		runs = append(runs, stage.Runs...)
 	}
-	switch len(runs) {
-	case 0:
+	if len(runs) == 0 {
 		return nil, errors.New("debugger: no jobs to run for this event")
-	case 1:
-		return runs[0], nil
-	default:
-		return nil, fmt.Errorf("debugger: v0.1 supports a single job, but the plan has %d", len(runs))
 	}
+	if jobID != "" {
+		for _, r := range runs {
+			if r.JobID == jobID {
+				return r, nil
+			}
+		}
+		return nil, fmt.Errorf("debugger: job %q not found; available jobs: %s", jobID, strings.Join(jobIDsOf(runs), ", "))
+	}
+	if len(runs) == 1 {
+		return runs[0], nil
+	}
+	return nil, &MultipleJobsError{Jobs: jobIDsOf(runs)}
+}
+
+func jobIDsOf(runs []*model.Run) []string {
+	ids := make([]string, 0, len(runs))
+	for _, r := range runs {
+		ids = append(ids, r.JobID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// seedNeeds writes the selected job's upstream needs into the workflow model so
+// act resolves needs.<job>.* locally (it reads them straight from there). It
+// replaces each upstream job's Outputs with only the user-supplied keys — so an
+// unseeded output is absent and resolves to empty, exactly like a non-existent
+// one in GitHub — and defaults the result to success unless overridden. Returns
+// a summary for a transparency line.
+func seedNeeds(run *model.Run, seeded map[string]NeedsInput) []NeedsSummary {
+	job := run.Job()
+	if job == nil {
+		return nil
+	}
+	var out []NeedsSummary
+	for _, name := range job.Needs() {
+		upstream := run.Workflow.GetJob(name)
+		if upstream == nil {
+			continue
+		}
+		in := seeded[name]
+		result := in.Result
+		assumed := result == ""
+		if assumed {
+			result = "success"
+		}
+		outputs := make(map[string]string, len(in.Outputs))
+		for k, v := range in.Outputs {
+			outputs[k] = v
+		}
+		upstream.Outputs = outputs
+		upstream.Result = result
+		out = append(out, NeedsSummary{Job: name, Result: result, Assumed: assumed, Outputs: outputs})
+	}
+	return out
 }
 
 func toWhen(w runner.BarrierWhen) When {

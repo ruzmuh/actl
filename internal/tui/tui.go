@@ -56,6 +56,7 @@ type Model struct {
 
 	title  string
 	labels []string // step labels, in order
+	needs  []string // transparency lines for the job's needs (isolated-run notices)
 
 	state  runState
 	cur    int // index of the step at the current/last pause (-1 before first)
@@ -84,11 +85,40 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 		cancel:      cancel,
 		title:       fmt.Sprintf("job %q", sess.JobID()),
 		labels:      labels,
+		needs:       needsLines(sess.NeedsSummary()),
 		state:       stateRunning,
 		cur:         -1,
 		breakpoints: make(map[int]bool),
 		tempBreak:   -1,
 	}
+}
+
+// needsLines renders one transparency line per need: which upstream job is being
+// faked locally, the assumed/seeded result, and any seeded outputs. This honest
+// notice is itself a feature — you see exactly what the isolated run stands on.
+func needsLines(summaries []debugger.NeedsSummary) []string {
+	lines := make([]string, 0, len(summaries))
+	for _, n := range summaries {
+		result := n.Result
+		if n.Assumed {
+			result += " (assumed)"
+		}
+		outs := "outputs: (none — unseeded resolve empty)"
+		if len(n.Outputs) > 0 {
+			keys := make([]string, 0, len(n.Outputs))
+			for k := range n.Outputs {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			pairs := make([]string, 0, len(keys))
+			for _, k := range keys {
+				pairs = append(pairs, k+"="+n.Outputs[k])
+			}
+			outs = "outputs: " + strings.Join(pairs, ", ")
+		}
+		lines = append(lines, fmt.Sprintf("needs %q isolated → result=%s · %s", n.Job, result, outs))
+	}
+	return lines
 }
 
 func (m Model) Init() tea.Cmd {
@@ -275,7 +305,11 @@ var (
 
 func (m Model) View() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("actl · "+m.title) + "\n\n")
+	b.WriteString(titleStyle.Render("actl · "+m.title) + "\n")
+	for _, line := range m.needs {
+		b.WriteString(dimStyle.Render("⚠ "+line) + "\n")
+	}
+	b.WriteString("\n")
 
 	// step list: [breakpoint] [cursor] N. label (state)
 	var steps strings.Builder
@@ -500,7 +534,7 @@ func (m Model) statusLine() string {
 	case statePaused:
 		where := fmt.Sprintf("%s step %d: %s", m.curAt.String(), m.cur+1, m.stepLabel(m.cur))
 		if m.curErr != nil {
-			where += errStyle.Render(" — step failed: "+m.curErr.Error())
+			where += errStyle.Render(" — step failed: " + m.curErr.Error())
 		}
 		return statusStyle.Render("⏸  paused "+where) +
 			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · g to-cursor · i edit-cmd · E edit-env · r rerun · e env · d shell · q quit")
