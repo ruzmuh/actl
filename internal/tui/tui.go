@@ -141,9 +141,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Hand the terminal to an interactive shell in the live
 					// container, then resume the TUI. The core stays out of the
 					// terminal; this is the frontend's job (CLAUDE.md §5).
-					c := exec.Command("docker", "exec", "-it", name, "sh", "-c",
-						"[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh")
-					return m, tea.ExecProcess(c, func(err error) tea.Msg { return shellDoneMsg{err} })
+					return m, tea.ExecProcess(m.shellCmd(name), func(err error) tea.Msg { return shellDoneMsg{err} })
 				}
 			}
 		}
@@ -225,6 +223,24 @@ func (m Model) View() string {
 
 	b.WriteString(m.statusLine())
 	return b.String()
+}
+
+// shellCmd builds a `docker exec -it` into the live container, injecting the
+// job env we captured so the shell matches the ENV pane (act passes step env
+// per-exec, so a plain exec would otherwise miss it — e.g. GREETING).
+func (m Model) shellCmd(name string) *exec.Cmd {
+	args := []string{"exec", "-it"}
+	env := m.sess.Env()
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "-e", k+"="+env[k])
+	}
+	args = append(args, name, "sh", "-c", "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh")
+	return exec.Command("docker", args...)
 }
 
 func (m Model) envPane() string {
