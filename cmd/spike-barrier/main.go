@@ -1,11 +1,13 @@
-// Command spike-barrier is a throwaway driver for Spike 2 (see CLAUDE.md): it
-// proves the soft-fork pause barrier works end to end. It runs a workflow through
-// act's real engine but installs actl's Config.StepBarrier hook, which pauses the
-// job pipeline before every step and waits for the user to press Enter to resume.
+// Command spike-barrier is a throwaway, line-based driver over the debugger core
+// (internal/debugger). It is the crudest possible front-end — a stand-in for the
+// real TUI — used to validate that the core's pause/step/continue loop works end
+// to end against act's real engine.
 //
-// This is NOT the debugger core or a frontend — it is the crudest possible proof
-// that we can stop act between step execs with a live container. The real core
-// (internal/debugger) and the TUI come next.
+// At each pause it prints the boundary and reads one key from stdin:
+//
+//	(enter)/s = step to the next boundary
+//	c         = continue to the next breakpoint / break-on-error / end
+//	q         = abort the run
 //
 // Requires Docker: act starts a real job container and execs each step into it.
 package main
@@ -16,9 +18,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
+
+	"github.com/ruzmuh/actl/internal/debugger"
 )
 
 func main() {
@@ -34,73 +38,61 @@ func main() {
 }
 
 func run(workflowPath, event, image string) error {
-	// act copies the workdir into the container; use an empty temp dir so we
-	// don't haul the whole repo (incl. the act submodule) into the container.
-	workdir, err := os.MkdirTemp("", "actl-spike-")
+	sess, err := debugger.New(debugger.Options{
+		WorkflowPath: workflowPath,
+		EventName:    event,
+		Image:        image,
+		BreakOnError: true,
+	})
 	if err != nil {
-		return fmt.Errorf("temp workdir: %w", err)
+		return err
 	}
-	defer os.RemoveAll(workdir)
 
-	planner, err := model.NewWorkflowPlanner(workflowPath, true, false)
-	if err != nil {
-		return fmt.Errorf("planner: %w", err)
+	fmt.Printf("debugging job %q (%s, event %q)\n", sess.JobID(), workflowPath, event)
+	for i, st := range sess.Steps() {
+		fmt.Printf("  %d. %s\n", i+1, st.String())
 	}
-	plan, err := planner.PlanEvent(event)
-	if err != nil {
-		return fmt.Errorf("plan event %q: %w", event, err)
-	}
-	if plan == nil || len(plan.Stages) == 0 {
-		return fmt.Errorf("no jobs to run for event %q", event)
-	}
+	fmt.Println("controls: [enter]/s step · c continue · q quit")
 
 	stdin := bufio.NewScanner(os.Stdin)
+	sess.Start(context.Background())
 
-	cfg := &runner.Config{
-		Workdir:     workdir,
-		BindWorkdir: false,
-		EventName:   event,
-		Platforms:   map[string]string{"ubuntu-latest": image},
-		AutoRemove:  true,
-		LogOutput:   true, // surface each step's stdout so the spike timeline is legible
-		Env:         map[string]string{},
-		Secrets:     map[string]string{},
-		Vars:        map[string]string{},
-
-		// The whole point of Spike 2: pause at every step boundary (before and
-		// after each step's main executor).
-		StepBarrier: func(_ context.Context, info runner.StepBarrierInfo) error {
-			switch info.When {
-			case runner.BarrierBefore:
-				fmt.Printf("\n⏸️  PAUSED %-6s step %d: %q  [%s]\n",
-					info.When, info.Index+1, info.Step.String(), kind(info.Step))
-			case runner.BarrierAfter:
-				outcome := "✅ ok"
-				if info.Err != nil {
-					outcome = "❌ FAILED: " + info.Err.Error()
-				}
-				fmt.Printf("\n⏸️  PAUSED %-6s step %d: %q  → %s\n",
-					info.When, info.Index+1, info.Step.String(), outcome)
+	for {
+		select {
+		case ev := <-sess.Pauses():
+			fmt.Printf("\n⏸️  %-6s step %d: %q%s\n", ev.When, ev.Index+1, ev.Step.String(), outcome(ev))
+			fmt.Print("   > ")
+			cmd := ""
+			if stdin.Scan() {
+				cmd = strings.TrimSpace(stdin.Text())
 			}
-			fmt.Print("   press Enter to resume (or Ctrl-C to quit)... ")
-			stdin.Scan()
-			fmt.Println("▶️  resuming")
+			switch cmd {
+			case "c":
+				fmt.Println("▶️  continue")
+				sess.Continue()
+			case "q":
+				fmt.Println("⏹️  abort")
+				sess.Abort()
+			default:
+				fmt.Println("▶️  step")
+				sess.Step()
+			}
+		case <-sess.Done():
+			if err := sess.Err(); err != nil {
+				return err
+			}
+			fmt.Println("\n✅ run complete")
 			return nil
-		},
+		}
 	}
-
-	r, err := runner.New(cfg)
-	if err != nil {
-		return fmt.Errorf("new runner: %w", err)
-	}
-
-	fmt.Printf("running %q (event %q) with the pause barrier installed\n", workflowPath, event)
-	return r.NewPlanExecutor(plan)(context.Background())
 }
 
-func kind(s *model.Step) string {
-	if s.Run != "" {
-		return "run"
+func outcome(ev debugger.PauseEvent) string {
+	if ev.When != runner.BarrierAfter {
+		return ""
 	}
-	return "uses: " + s.Uses
+	if ev.Err != nil {
+		return "  → ❌ " + ev.Err.Error()
+	}
+	return "  → ✅ ok"
 }
