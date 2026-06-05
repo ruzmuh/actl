@@ -1,0 +1,47 @@
+# Demonstrates workflow_dispatch inputs. For a manually-triggered run GitHub injects
+# inputs.* — applying each input's declared default and type when you omit it. Locally
+# you pass them with -input NAME=VALUE; omitted inputs fall back to the declared
+# default below (act applies that, including boolean typing). The TUI prints which
+# inputs you provided vs. left to their default.
+#
+#   # every input uses its declared default:
+#   go run ./cmd/actl -event workflow_dispatch testdata/workflows/inputs.yml
+#
+#   # override two of them:
+#   go run ./cmd/actl -event workflow_dispatch \
+#     -input environment=production -input dry-run=false \
+#     testdata/workflows/inputs.yml
+name: inputs
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: target environment
+        type: choice
+        default: staging
+        options: [staging, production]
+      version:
+        description: release version
+        default: 0.0.0
+      dry-run:
+        description: skip the real deploy
+        type: boolean
+        default: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: show the resolved inputs
+        run: |
+          echo "environment = ${{ inputs.environment }}"
+          echo "version     = ${{ inputs.version }}"
+          echo "dry-run     = ${{ inputs.dry-run }}"
+
+      - name: branch on the boolean input
+        run: |
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            echo "DRY RUN — not deploying ${{ inputs.version }}"
+          else
+            echo "deploying ${{ inputs.version }} to ${{ inputs.environment }}"
+          fi

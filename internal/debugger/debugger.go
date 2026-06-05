@@ -13,6 +13,7 @@ package debugger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -78,6 +79,42 @@ type GCPIdentity struct {
 	Account        string // local identity, for the transparency line (best-effort, may be empty)
 }
 
+// TokenSummary is a redacted view of the GITHUB_TOKEN substitution for a
+// transparency line: whether github.token was set and where it came from, never
+// the token itself.
+type TokenSummary struct {
+	Present bool   // github.token (and secrets.GITHUB_TOKEN) was set
+	Source  string // "flag", "secret", or "" when absent
+}
+
+// InputsSummary lists the workflow's declared dispatch/call inputs and which were
+// supplied vs. left to their declared default, for a transparency line. Values are
+// the user's own CLI inputs (not secrets), so they're shown.
+type InputsSummary struct {
+	Provided map[string]string // inputs.* the user supplied
+	Defaults []string          // declared inputs not supplied (act fills their default)
+	Declared bool              // the workflow declares inputs for this event
+}
+
+// EventSummary describes the github.event payload backing the run, for a
+// transparency line.
+type EventSummary struct {
+	EventName string // the planned event (github.event_name)
+	Path      string // user-supplied event JSON path, if any (else synthesized "{}")
+	Synthetic bool   // payload was synthesized (no -event-file)
+}
+
+// GitHubContextSummary is the resolved github.* runtime context for a transparency
+// line: the values act will expose (repository/ref/sha/actor), which the user
+// overrode, and a note that run ids are placeholders locally.
+type GitHubContextSummary struct {
+	Repository string   // github.repository (resolved from local git or overridden)
+	Ref        string   // github.ref
+	Sha        string   // github.sha (short, for display)
+	Actor      string   // github.actor ("" → act's "nektos/act" placeholder)
+	Overridden []string // which of repository/ref/sha/actor came from a flag
+}
+
 // GCPSummary is a redacted view of the GCP identity substitution for a transparency
 // line: which auth steps were intercepted, the federation target each one would have
 // used in real CI, and the local identity we run as instead. No token material is
@@ -109,6 +146,16 @@ type Options struct {
 	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
 	BreakOnError bool                  // in Continue mode, halt after a step that errored
 	Breakpoints  []int                 // zero-based step indices to halt before, in Continue mode
+
+	// Runtime context GitHub injects in real CI that a clean local runner lacks
+	// — all seed-and-be-honest surfaces (CLAUDE.md §4), each with a transparency line.
+	GitHubToken string            // GITHUB_TOKEN → github.token (and mirrored into secrets.GITHUB_TOKEN); empty falls back to Secrets["GITHUB_TOKEN"]
+	Inputs      map[string]string // workflow_dispatch/workflow_call inputs.* (user values; act applies declared defaults + typing on top)
+	EventPath   string            // path to a github.event payload JSON; empty = "{}" (plus any Inputs)
+	Repository  string            // override github.repository (env GITHUB_REPOSITORY); empty = act derives from local git
+	Ref         string            // override github.ref (env GITHUB_REF); empty = act derives from local git
+	Sha         string            // override github.sha (env SHA_REF, act's read key); empty = act derives from local git
+	Actor       string            // override github.actor (Config.Actor); empty = act's "nektos/act" placeholder
 }
 
 // When marks which side of a step's main executor a pause occurred on. It mirrors
@@ -152,20 +199,25 @@ type control struct {
 type Session struct {
 	jobID          string
 	steps          []*model.Step
-	needs          []NeedsSummary    // how the selected job's needs were satisfied locally (for transparency)
-	withDeps       bool              // upstream needs run for real before the target job
-	isolatedWS     bool              // workspace is an empty temp dir (no user repo) → local actions won't resolve
-	workspace      string            // the bind-mounted workspace path (empty unless -workdir given)
-	checkouts      map[int]bool      // step indices of intercepted default checkouts (rewritten to no-ops)
-	checkoutLabels []string          // their labels, for transparency
-	checkoutSource string            // host tree copied into the workspace at checkout (empty unless copy mode)
-	configSummary  ConfigSummary     // redacted names of supplied secrets/vars/env (for transparency)
-	gcpSteps       map[int]bool      // step indices of intercepted google-github-actions/auth steps
-	gcpEnv         map[string]string // GCP credential env injected at the auth step's position (nil if no identity)
-	gcpSummary     GCPSummary        // redacted view of the GCP identity substitution (for transparency)
+	needs          []NeedsSummary       // how the selected job's needs were satisfied locally (for transparency)
+	withDeps       bool                 // upstream needs run for real before the target job
+	isolatedWS     bool                 // workspace is an empty temp dir (no user repo) → local actions won't resolve
+	workspace      string               // the bind-mounted workspace path (empty unless -workdir given)
+	checkouts      map[int]bool         // step indices of intercepted default checkouts (rewritten to no-ops)
+	checkoutLabels []string             // their labels, for transparency
+	checkoutSource string               // host tree copied into the workspace at checkout (empty unless copy mode)
+	configSummary  ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
+	gcpSteps       map[int]bool         // step indices of intercepted google-github-actions/auth steps
+	gcpEnv         map[string]string    // GCP credential env injected at the auth step's position (nil if no identity)
+	gcpSummary     GCPSummary           // redacted view of the GCP identity substitution (for transparency)
+	tokenSummary   TokenSummary         // how github.token was satisfied (for transparency)
+	inputsSummary  InputsSummary        // declared/supplied workflow inputs (for transparency)
+	eventSummary   EventSummary         // the github.event payload backing the run (for transparency)
+	ghcSummary     GitHubContextSummary // resolved github.* runtime context (for transparency)
 	runner         runner.Runner
 	plan           *model.Plan
 	tmpDir         string // non-empty if we created (and must clean up) the workdir
+	eventFile      string // non-empty if we wrote (and must clean up) a merged event.json
 
 	pauses  chan PauseEvent
 	resume  chan control
@@ -253,6 +305,18 @@ func New(opts Options) (*Session, error) {
 	gcpEnv, gcpSummary := buildGCP(opts.GCP, gcpSteps, gcpTargets)
 	gcpSummary.Steps = stepLabelsOf(run.Job().Steps, gcpSteps)
 
+	// Runtime context GitHub injects that a clean local runner lacks (CLAUDE.md §4):
+	// GITHUB_TOKEN, workflow inputs, the event payload, and the github.* context.
+	// Each is seeded here and reported via a transparency line; none needs a fork patch.
+	secrets := orEmpty(opts.Secrets)
+	token, tokenSummary := resolveToken(opts.GitHubToken, secrets) // also mirrors token into secrets.GITHUB_TOKEN
+	eventPath, eventFile, eventSummary, err := buildEvent(opts)
+	if err != nil {
+		return nil, err
+	}
+	inputsSummary := summarizeInputs(run.Workflow, opts.EventName, opts.Inputs)
+	ghcEnv, ghcSummary := buildGitHubContext(opts)
+
 	workdir := opts.Workdir
 	var tmpDir, bindWS, checkoutSource string
 	switch {
@@ -304,8 +368,13 @@ func New(opts Options) (*Session, error) {
 		gcpSteps:       gcpSteps,
 		gcpEnv:         gcpEnv,
 		gcpSummary:     gcpSummary,
+		tokenSummary:   tokenSummary,
+		inputsSummary:  inputsSummary,
+		eventSummary:   eventSummary,
+		ghcSummary:     ghcSummary,
 		plan:           execPlan,
 		tmpDir:         tmpDir,
+		eventFile:      eventFile,
 		pauses:         make(chan PauseEvent),
 		resume:         make(chan control),
 		logs:           make(chan string, 1024),
@@ -319,11 +388,15 @@ func New(opts Options) (*Session, error) {
 	cfg := &runner.Config{
 		Workdir:    workdir,
 		EventName:  opts.EventName,
+		EventPath:  eventPath,            // user-supplied or merged-with-inputs event.json ("" = act synthesizes)
+		Inputs:     orEmpty(opts.Inputs), // ignored by act when EventPath is set; harmless otherwise
+		Token:      token,                // github.token (mirrored into secrets.GITHUB_TOKEN above)
+		Actor:      opts.Actor,           // github.actor ("" → act's "nektos/act" placeholder)
 		Platforms:  map[string]string{"ubuntu-latest": opts.Image},
 		AutoRemove: true,
-		LogOutput:  true, // route step stdout through the logger (captured below)
-		Env:        orEmpty(opts.Env),
-		Secrets:    orEmpty(opts.Secrets),
+		LogOutput:  true,                                // route step stdout through the logger (captured below)
+		Env:        mergeEnv(orEmpty(opts.Env), ghcEnv), // github.* overrides (GITHUB_REPOSITORY/GITHUB_REF/SHA_REF) layered onto -env
+		Secrets:    secrets,
 		Vars:       orEmpty(opts.Vars),
 		// A user-supplied workdir is bind-mounted: act's copy mode leaves the
 		// workspace volume empty (it never populates it), so local `uses: ./…`
@@ -396,6 +469,21 @@ func (s *Session) ConfigSummary() ConfigSummary { return s.configSummary }
 // auth steps were intercepted, the federation target vs the local identity), for a
 // transparency line. Its Steps are empty when the job has no auth step.
 func (s *Session) GCPSummary() GCPSummary { return s.gcpSummary }
+
+// TokenSummary reports how github.token was satisfied (set from a flag/secret, or
+// absent), for a transparency line.
+func (s *Session) TokenSummary() TokenSummary { return s.tokenSummary }
+
+// InputsSummary reports the workflow's declared inputs and which were supplied vs
+// defaulted, for a transparency line. Declared is false when the event takes no inputs.
+func (s *Session) InputsSummary() InputsSummary { return s.inputsSummary }
+
+// EventSummary reports the github.event payload backing the run, for a transparency line.
+func (s *Session) EventSummary() EventSummary { return s.eventSummary }
+
+// GitHubContextSummary reports the resolved github.* runtime context (repository/
+// ref/sha/actor and any overrides), for a transparency line.
+func (s *Session) GitHubContextSummary() GitHubContextSummary { return s.ghcSummary }
 
 // LocalUsesSteps returns the labels of steps that reference a local action
 // (`uses: ./…`) — these need a real workspace (run with a workdir set).
@@ -797,6 +885,9 @@ func (s *Session) cleanup() {
 	if s.tmpDir != "" {
 		_ = os.RemoveAll(s.tmpDir)
 	}
+	if s.eventFile != "" {
+		_ = os.Remove(s.eventFile)
+	}
 }
 
 // selectRun picks the single job to debug. With jobID set it returns that job
@@ -915,4 +1006,181 @@ func orEmpty(m map[string]string) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+// resolveToken decides the value behind github.token. An explicit flag wins; else
+// it falls back to a GITHUB_TOKEN already present in secrets (act's CLI does the same
+// at cmd/root.go). When a token is found it is mirrored into secrets["GITHUB_TOKEN"]
+// so github.token and secrets.GITHUB_TOKEN stay equal, as they are on real GitHub.
+// secrets is mutated in place (it is the map handed to runner.Config.Secrets).
+func resolveToken(flag string, secrets map[string]string) (string, TokenSummary) {
+	token, source := flag, "flag"
+	if token == "" {
+		token, source = secrets["GITHUB_TOKEN"], "secret"
+	}
+	if token == "" {
+		return "", TokenSummary{}
+	}
+	secrets["GITHUB_TOKEN"] = token
+	return token, TokenSummary{Present: true, Source: source}
+}
+
+// buildEvent decides the github.event payload backing the run. GitHub injects an
+// event payload; a clean local runner has none. The cases:
+//   - no event file, no inputs → act synthesizes "{}" (eventPath empty)
+//   - no event file, inputs     → act builds {"inputs": …} from Config.Inputs (eventPath empty)
+//   - event file, no inputs     → use it as-is
+//   - event file + inputs       → act ignores Config.Inputs once EventPath is set, so we
+//     merge the inputs into the file's "inputs" and write a temp event.json
+//
+// Returns the eventPath to set on Config, a tmp path to clean up (or ""), and a summary.
+func buildEvent(opts Options) (eventPath, tmpFile string, _ EventSummary, _ error) {
+	summary := EventSummary{EventName: opts.EventName, Path: opts.EventPath, Synthetic: opts.EventPath == ""}
+	if opts.EventPath == "" {
+		return "", "", summary, nil // act synthesizes "{}" (+ Config.Inputs)
+	}
+	raw, err := os.ReadFile(opts.EventPath)
+	if err != nil {
+		return "", "", EventSummary{}, fmt.Errorf("debugger: event file: %w", err)
+	}
+	if len(opts.Inputs) == 0 {
+		return opts.EventPath, "", summary, nil // use the file as-is
+	}
+	// Merge inputs into the event payload (act would otherwise drop Config.Inputs).
+	var event map[string]any
+	if err := json.Unmarshal(raw, &event); err != nil {
+		return "", "", EventSummary{}, fmt.Errorf("debugger: event file %s: %w", opts.EventPath, err)
+	}
+	if event == nil {
+		event = map[string]any{}
+	}
+	inputs, _ := event["inputs"].(map[string]any)
+	if inputs == nil {
+		inputs = map[string]any{}
+	}
+	for k, v := range opts.Inputs {
+		inputs[k] = v
+	}
+	event["inputs"] = inputs
+	merged, err := json.Marshal(event)
+	if err != nil {
+		return "", "", EventSummary{}, fmt.Errorf("debugger: merge event inputs: %w", err)
+	}
+	f, err := os.CreateTemp("", "actl-event-*.json")
+	if err != nil {
+		return "", "", EventSummary{}, fmt.Errorf("debugger: event temp: %w", err)
+	}
+	if _, err := f.Write(merged); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", "", EventSummary{}, fmt.Errorf("debugger: write event temp: %w", err)
+	}
+	_ = f.Close()
+	return f.Name(), f.Name(), summary, nil
+}
+
+// summarizeInputs reports which of the workflow's declared inputs (for the planned
+// event) the user supplied vs. left to act's declared-default fill, for a
+// transparency line. act applies the defaults and typing itself (expression.go), so
+// this is display-only — we never re-derive them.
+func summarizeInputs(wf *model.Workflow, event string, provided map[string]string) InputsSummary {
+	declared := declaredInputs(wf, event)
+	s := InputsSummary{Declared: len(declared) > 0}
+	if len(provided) > 0 {
+		s.Provided = make(map[string]string, len(provided))
+		for k, v := range provided {
+			s.Provided[k] = v
+		}
+	}
+	for name := range declared {
+		if _, ok := provided[name]; !ok {
+			s.Defaults = append(s.Defaults, name)
+		}
+	}
+	sort.Strings(s.Defaults)
+	return s
+}
+
+// declaredInputs returns the set of input names the workflow declares for the
+// planned event (workflow_dispatch or workflow_call), or nil for other events.
+func declaredInputs(wf *model.Workflow, event string) map[string]struct{} {
+	if wf == nil {
+		return nil
+	}
+	out := map[string]struct{}{}
+	switch event {
+	case "workflow_dispatch":
+		if c := wf.WorkflowDispatchConfig(); c != nil {
+			for k := range c.Inputs {
+				out[k] = struct{}{}
+			}
+		}
+	case "workflow_call":
+		if c := wf.WorkflowCallConfig(); c != nil {
+			for k := range c.Inputs {
+				out[k] = struct{}{}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// buildGitHubContext maps the github.* overrides to the env keys act reads when
+// synthesizing the github context (github_context.go): GITHUB_REPOSITORY and
+// GITHUB_REF survive because act only derives them when unset, and the sha is read
+// from SHA_REF. Actor is handled via Config.Actor, not here. Returns the env to
+// layer onto -env plus a summary for the transparency line. Unset fields are left
+// for act to derive from local git (and the summary shows them empty).
+func buildGitHubContext(opts Options) (map[string]string, GitHubContextSummary) {
+	env := map[string]string{}
+	var overridden []string
+	if opts.Repository != "" {
+		env["GITHUB_REPOSITORY"] = opts.Repository
+		overridden = append(overridden, "repository")
+	}
+	if opts.Ref != "" {
+		env["GITHUB_REF"] = opts.Ref
+		overridden = append(overridden, "ref")
+	}
+	if opts.Sha != "" {
+		env["SHA_REF"] = opts.Sha // act reads the sha from SHA_REF (github_context.go)
+		overridden = append(overridden, "sha")
+	}
+	if opts.Actor != "" {
+		overridden = append(overridden, "actor")
+	}
+	return env, GitHubContextSummary{
+		Repository: opts.Repository,
+		Ref:        opts.Ref,
+		Sha:        shortSha(opts.Sha),
+		Actor:      opts.Actor,
+		Overridden: overridden,
+	}
+}
+
+// shortSha trims a commit sha to 7 chars for display (leaves shorter strings as-is).
+func shortSha(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// mergeEnv overlays add onto base (add wins) without mutating either; base is
+// returned when add is empty.
+func mergeEnv(base, add map[string]string) map[string]string {
+	if len(add) == 0 {
+		return base
+	}
+	out := make(map[string]string, len(base)+len(add))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range add {
+		out[k] = v
+	}
+	return out
 }

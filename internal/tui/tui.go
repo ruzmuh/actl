@@ -120,6 +120,14 @@ func noticeLines(sess *debugger.Session) []string {
 	if cfg := configLine(sess.ConfigSummary()); cfg != "" {
 		lines = append(lines, cfg)
 	}
+	lines = append(lines, tokenLine(sess.TokenSummary()))
+	if in := inputsLine(sess.InputsSummary()); in != "" {
+		lines = append(lines, in)
+	}
+	if ev := eventLine(sess.EventSummary()); ev != "" {
+		lines = append(lines, ev)
+	}
+	lines = append(lines, ghcLine(sess.GitHubContextSummary()))
 	if steps := sess.CheckoutSteps(); len(steps) > 0 {
 		if src := sess.CheckoutSource(); src != "" {
 			lines = append(lines, fmt.Sprintf("checkout intercepted (%s) — copies your working tree %s (.gitignore respected)",
@@ -221,6 +229,83 @@ func configLine(cfg debugger.ConfigSummary) string {
 		return ""
 	}
 	return "loaded " + strings.Join(parts, " · ") + " (names only — values withheld)"
+}
+
+// tokenLine renders the github.token substitution: in real CI it's an ephemeral,
+// repo-scoped token; locally we run as the dev's own token (or none). Like identity
+// (§4), the honest note is the point — your token's scope differs from CI's.
+func tokenLine(t debugger.TokenSummary) string {
+	if !t.Present {
+		return "github token: none set — github.token is empty; gh, API calls, and checkout with a ref will fail (pass -github-token, set GITHUB_TOKEN, or 'gh auth login')"
+	}
+	return fmt.Sprintf("github token: github.token set (from %s) — running as your token, broader scope than CI's ephemeral repo-scoped GITHUB_TOKEN", t.Source)
+}
+
+// inputsLine renders which declared workflow inputs were supplied vs left to their
+// declared default (act fills the defaults itself). Empty when the event takes no
+// inputs and none were supplied.
+func inputsLine(s debugger.InputsSummary) string {
+	if !s.Declared && len(s.Provided) == 0 {
+		return ""
+	}
+	var parts []string
+	if len(s.Provided) > 0 {
+		keys := make([]string, 0, len(s.Provided))
+		for k := range s.Provided {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		pairs := make([]string, 0, len(keys))
+		for _, k := range keys {
+			pairs = append(pairs, k+"="+s.Provided[k])
+		}
+		parts = append(parts, "provided "+strings.Join(pairs, ", "))
+	}
+	if len(s.Defaults) > 0 {
+		parts = append(parts, fmt.Sprintf("%d using declared default(s): %s", len(s.Defaults), strings.Join(s.Defaults, ", ")))
+	}
+	if len(parts) == 0 {
+		return "inputs: declared, none provided (act applies declared defaults)"
+	}
+	return "inputs: " + strings.Join(parts, " · ")
+}
+
+// eventLine renders the github.event payload source. Only shown when the user
+// supplied an event file; a synthesized empty payload is the unremarkable default.
+func eventLine(e debugger.EventSummary) string {
+	if e.Synthetic {
+		return ""
+	}
+	return fmt.Sprintf("event payload: %s (event_name=%s)", e.Path, e.EventName)
+}
+
+// ghcLine renders the synthesized github.* runtime context (CLAUDE.md §4): the
+// repository/ref/sha actl resolved from local git (or you overrode), and the
+// placeholders a clean local runner can't know (actor, run ids). Honest visibility
+// into what the workflow stands on locally.
+func ghcLine(g debugger.GitHubContextSummary) string {
+	ov := map[string]bool{}
+	for _, o := range g.Overridden {
+		ov[o] = true
+	}
+	field := func(name, val string) string {
+		if val == "" {
+			val = "act-derived"
+		}
+		if ov[name] {
+			val += " (override)"
+		}
+		return val
+	}
+	actor := g.Actor
+	switch {
+	case actor == "":
+		actor = "nektos/act (placeholder)"
+	case ov["actor"]:
+		actor += " (override)"
+	}
+	return fmt.Sprintf("github context: repository=%s · ref=%s · sha=%s · actor=%s · run_id/number=1 (placeholder)",
+		field("repository", g.Repository), field("ref", g.Ref), field("sha", g.Sha), actor)
 }
 
 func (m Model) Init() tea.Cmd {
@@ -396,13 +481,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case shellDoneMsg:
 		if msg.err != nil {
-			m.appendLog("shell: "+msg.err.Error())
+			m.appendLog("shell: " + msg.err.Error())
 		}
 		return m, nil
 
 	case rerunDoneMsg:
 		if msg.err != nil {
-			m.appendLog("rerun: "+msg.err.Error())
+			m.appendLog("rerun: " + msg.err.Error())
 		}
 		return m, nil
 
@@ -568,7 +653,7 @@ func (m Model) editCmd(kind editKind, initial string) tea.Cmd {
 
 func (m *Model) applyEdit(msg editDoneMsg) {
 	if msg.err != nil {
-		m.appendLog("edit: "+msg.err.Error())
+		m.appendLog("edit: " + msg.err.Error())
 		return
 	}
 	switch msg.kind {

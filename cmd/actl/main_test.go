@@ -115,3 +115,32 @@ func TestParseNeedsErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestParseGitRepo turns the ssh and https remote forms into owner/repo, and
+// rejects anything that isn't a clean single owner/repo pair.
+func TestParseGitRepo(t *testing.T) {
+	cases := map[string]string{
+		"git@github.com:ruzmuh/actl.git":       "ruzmuh/actl",
+		"https://github.com/ruzmuh/actl.git":   "ruzmuh/actl",
+		"https://github.com/ruzmuh/actl":       "ruzmuh/actl",
+		"ssh://git@github.com/ruzmuh/actl.git": "ruzmuh/actl",
+		"https://ghe.corp/team/sub/repo.git":   "", // too many path segments
+		"":                                     "",
+		"not-a-url":                            "",
+	}
+	for in, want := range cases {
+		if got := parseGitRepo(in); got != want {
+			t.Errorf("parseGitRepo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestFirstNonEmpty returns the first non-empty argument.
+func TestFirstNonEmpty(t *testing.T) {
+	if got := firstNonEmpty("", "", "x", "y"); got != "x" {
+		t.Errorf("firstNonEmpty = %q, want x", got)
+	}
+	if got := firstNonEmpty("", ""); got != "" {
+		t.Errorf("firstNonEmpty all-empty = %q, want empty", got)
+	}
+}

@@ -47,11 +47,18 @@ func main() {
 	envFile := flag.String("env-file", ".env", "dotenv file of env vars (skipped if absent)")
 	gcpIdentity := flag.Bool("gcp-identity", true, "substitute ambient gcloud ADC for a federated google-github-actions/auth step (=false leaves it untouched)")
 	gcpCreds := flag.String("gcp-credentials", "", "path to the ADC json to inject (default: discover gcloud's application_default_credentials.json)")
-	var needs, envs, secrets, vars stringSlice
+	githubToken := flag.String("github-token", "", "value for github.token / secrets.GITHUB_TOKEN (default: GITHUB_TOKEN from .secrets, else ambient 'gh auth token')")
+	eventFile := flag.String("event-file", "", "path to a github.event payload JSON (sets github.event.*)")
+	repository := flag.String("repository", "", "override github.repository (default: derive owner/repo from the local git 'origin' remote)")
+	ref := flag.String("ref", "", "override github.ref, e.g. refs/heads/main (default: derive from the local git HEAD)")
+	sha := flag.String("sha", "", "override github.sha (default: derive from the local git HEAD)")
+	actor := flag.String("actor", "", "override github.actor (default: act's 'nektos/act' placeholder)")
+	var needs, envs, secrets, vars, inputs stringSlice
 	flag.Var(&needs, "need", "seed an upstream needs value: 'JOB.outputs.NAME=VALUE' or 'JOB.result=VALUE' (repeatable)")
 	flag.Var(&envs, "env", "set an env var for the run: 'KEY=VALUE' (repeatable, overrides -env-file)")
 	flag.Var(&secrets, "secret", "set a secret for the run: 'KEY=VALUE' (repeatable, overrides -secret-file)")
 	flag.Var(&vars, "var", "set a var for the run: 'KEY=VALUE' (repeatable, overrides -var-file)")
+	flag.Var(&inputs, "input", "set a workflow_dispatch/workflow_call input: 'NAME=VALUE' (repeatable)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: actl [flags] [workflow.yml]\n\n")
 		flag.PrintDefaults()
@@ -91,6 +98,20 @@ func main() {
 		gcp = gatherGCPIdentity(path, *gcpCreds)
 	}
 
+	// github.token: explicit flag wins; the core falls back to a GITHUB_TOKEN in
+	// .secrets; failing both, try the dev's ambient `gh` login (best-effort, like
+	// gcloud for GCP). The transparency line makes the substitution loud.
+	token := *githubToken
+	if token == "" && secretMap["GITHUB_TOKEN"] == "" {
+		token = ghValue("auth", "token")
+	}
+
+	// github.* runtime context: each flag wins, otherwise derive from the local git
+	// repo (the source tree being debugged) so the transparency line shows real
+	// values; empty leaves it for act to derive.
+	gitDir := firstNonEmpty(*source, *workdir, ".")
+	repo, gref, gsha := resolveGitHubContext(gitDir, *repository, *ref, *sha)
+
 	opts := debugger.Options{
 		WorkflowPath: path,
 		EventName:    *event,
@@ -105,6 +126,13 @@ func main() {
 		Vars:         varMap,
 		Env:          envMap,
 		GCP:          gcp,
+		GitHubToken:  token,
+		Inputs:       parseKeyVals(inputs),
+		EventPath:    *eventFile,
+		Repository:   repo,
+		Ref:          gref,
+		Sha:          gsha,
+		Actor:        *actor,
 	}
 
 	if err := run(opts); err != nil {
@@ -238,6 +266,77 @@ func gcloudValue(args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// ghValue runs `gh <args...>` and returns the trimmed stdout, or "" on any error
+// (gh absent, not logged in, etc.) — best-effort, like gcloudValue.
+func ghValue(args ...string) string {
+	out, err := exec.Command("gh", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// resolveGitHubContext fills github.repository/ref/sha: a non-empty override wins,
+// otherwise it derives the value from the local git repo at dir (best-effort — a
+// missing value is left empty for act to derive). Pure-ish (only shells out to git),
+// so the values feed both the run and the transparency line.
+func resolveGitHubContext(dir, repoOverride, refOverride, shaOverride string) (repo, ref, sha string) {
+	repo = repoOverride
+	if repo == "" {
+		repo = parseGitRepo(gitValue(dir, "remote", "get-url", "origin"))
+	}
+	ref = refOverride
+	if ref == "" {
+		ref = gitValue(dir, "symbolic-ref", "--quiet", "HEAD") // "refs/heads/<branch>"; empty when detached
+	}
+	sha = shaOverride
+	if sha == "" {
+		sha = gitValue(dir, "rev-parse", "HEAD")
+	}
+	return repo, ref, sha
+}
+
+// gitValue runs `git -C dir <args...>` and returns trimmed stdout, or "" on error.
+func gitValue(dir string, args ...string) string {
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// parseGitRepo turns a git remote URL into "owner/repo", handling the ssh
+// (git@host:owner/repo.git) and https (https://host/owner/repo.git) forms. Returns
+// "" if it can't extract an owner/repo pair.
+func parseGitRepo(url string) string {
+	if url == "" {
+		return ""
+	}
+	url = strings.TrimSuffix(url, ".git")
+	if i := strings.Index(url, "://"); i >= 0 { // strip scheme + host
+		rest := url[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			url = rest[j+1:]
+		}
+	} else if i := strings.LastIndex(url, ":"); i >= 0 { // scp-like: host:owner/repo
+		url = url[i+1:]
+	}
+	if strings.Count(url, "/") != 1 || strings.HasPrefix(url, "/") || strings.HasSuffix(url, "/") {
+		return ""
+	}
+	return url
+}
+
+// firstNonEmpty returns the first non-empty argument, or "" if all are empty.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // parseKeyVals turns 'KEY=VALUE' entries into a map (later wins on duplicates).

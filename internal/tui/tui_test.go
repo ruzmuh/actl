@@ -179,6 +179,47 @@ func TestConfigLine(t *testing.T) {
 	}
 }
 
+// TestRuntimeContextLines locks the §4 transparency banner for the GitHub runtime
+// context a clean local runner lacks: token, inputs, event, and github.* context.
+func TestRuntimeContextLines(t *testing.T) {
+	// token: present names the source + the honest scope note; absent warns
+	if got := tokenLine(debugger.TokenSummary{Present: true, Source: "secret"}); !strings.Contains(got, "from secret") || !strings.Contains(got, "broader scope") {
+		t.Errorf("token present line wrong: %q", got)
+	}
+	if got := tokenLine(debugger.TokenSummary{}); !strings.Contains(got, "none set") || !strings.Contains(got, "-github-token") {
+		t.Errorf("token absent line wrong: %q", got)
+	}
+
+	// inputs: provided values shown, defaulted names counted; empty when undeclared
+	in := inputsLine(debugger.InputsSummary{Declared: true, Provided: map[string]string{"env": "prod"}, Defaults: []string{"region", "tier"}})
+	if !strings.Contains(in, "provided env=prod") || !strings.Contains(in, "2 using declared default(s): region, tier") {
+		t.Errorf("inputs line wrong: %q", in)
+	}
+	if inputsLine(debugger.InputsSummary{}) != "" {
+		t.Error("no declared/provided inputs should render no line")
+	}
+
+	// event: only shown for an explicit file
+	if got := eventLine(debugger.EventSummary{EventName: "pull_request", Path: "/tmp/e.json"}); !strings.Contains(got, "/tmp/e.json") || !strings.Contains(got, "pull_request") {
+		t.Errorf("event line wrong: %q", got)
+	}
+	if eventLine(debugger.EventSummary{Synthetic: true}) != "" {
+		t.Error("synthetic event should render no line")
+	}
+
+	// github context: resolved values, override marker, placeholders for the unknowable
+	ghc := ghcLine(debugger.GitHubContextSummary{Repository: "o/r", Ref: "refs/heads/main", Sha: "0123456", Actor: "alice", Overridden: []string{"actor"}})
+	for _, want := range []string{"repository=o/r", "ref=refs/heads/main", "sha=0123456", "actor=alice (override)", "run_id/number=1 (placeholder)"} {
+		if !strings.Contains(ghc, want) {
+			t.Errorf("ghc line missing %q: %q", want, ghc)
+		}
+	}
+	// empty fields fall back to act-derived / placeholder
+	if got := ghcLine(debugger.GitHubContextSummary{}); !strings.Contains(got, "repository=act-derived") || !strings.Contains(got, "actor=nektos/act (placeholder)") {
+		t.Errorf("empty ghc line wrong: %q", got)
+	}
+}
+
 // TestGCPLines locks the identity transparency: the federation target vs the local
 // identity, what was injected, and the honest no-credentials case.
 func TestGCPLines(t *testing.T) {

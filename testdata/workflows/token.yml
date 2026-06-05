@@ -1,0 +1,40 @@
+# Demonstrates the GITHUB_TOKEN substitution. In real CI, GitHub mints an ephemeral,
+# repo-scoped github.token (the same value as secrets.GITHUB_TOKEN); locally there is
+# no OIDC issuer to mint one, so actl uses a token you already have: -github-token, a
+# GITHUB_TOKEN in .secrets, or — failing both — your ambient `gh auth token`. The TUI
+# prints a transparency line noting that your token's scope differs from CI's ephemeral
+# one. Note: github.token is NOT auto-exported as $GITHUB_TOKEN (faithful to GitHub) —
+# you map it into env yourself, as the last step shows.
+#
+#   gh auth login                                   # or: printf 'GITHUB_TOKEN=ghp_…\n' > .secrets
+#   go run ./cmd/actl testdata/workflows/token.yml
+#
+# With no token available the first step reports it empty and the TUI warns that gh /
+# API calls and a checkout with a ref would fail.
+name: token
+on: push
+
+jobs:
+  token:
+    runs-on: ubuntu-latest
+    steps:
+      - name: github.token is present (length only — never print the value)
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "github.token is set (length ${#TOKEN})"
+          else
+            echo "github.token is EMPTY — pass -github-token, set GITHUB_TOKEN, or run 'gh auth login'"
+          fi
+        env:
+          TOKEN: ${{ github.token }}
+
+      - name: secrets.GITHUB_TOKEN mirrors github.token
+        run: echo "secrets.GITHUB_TOKEN length ${#GH} (equal to github.token, as on GitHub)"
+        env:
+          GH: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: the real-world pattern — map it into env for gh / curl
+        run: |
+          echo "GITHUB_TOKEN exported for this step? ${GITHUB_TOKEN:+yes}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

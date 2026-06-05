@@ -1,6 +1,7 @@
 package debugger
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -519,5 +520,171 @@ func TestShouldHaltPolicy(t *testing.T) {
 				t.Errorf("shouldHalt = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestResolveToken: an explicit token wins; otherwise a GITHUB_TOKEN secret is
+// used and mirrored so github.token and secrets.GITHUB_TOKEN stay equal; absent
+// yields an empty, not-present summary.
+func TestResolveToken(t *testing.T) {
+	// flag wins, and is mirrored into secrets so secrets.GITHUB_TOKEN resolves too
+	sec := map[string]string{}
+	tok, sum := resolveToken("ghp_flag", sec)
+	if tok != "ghp_flag" || !sum.Present || sum.Source != "flag" {
+		t.Errorf("flag path: tok=%q sum=%+v", tok, sum)
+	}
+	if sec["GITHUB_TOKEN"] != "ghp_flag" {
+		t.Errorf("flag token not mirrored into secrets: %v", sec)
+	}
+
+	// secret fallback when no flag
+	sec = map[string]string{"GITHUB_TOKEN": "ghp_secret"}
+	tok, sum = resolveToken("", sec)
+	if tok != "ghp_secret" || sum.Source != "secret" {
+		t.Errorf("secret path: tok=%q sum=%+v", tok, sum)
+	}
+
+	// absent
+	if tok, sum := resolveToken("", map[string]string{}); tok != "" || sum.Present {
+		t.Errorf("absent path: tok=%q sum=%+v", tok, sum)
+	}
+}
+
+// TestBuildEvent covers the four payload cases, especially merging -input values
+// into a supplied event file (act drops Config.Inputs once EventPath is set).
+func TestBuildEvent(t *testing.T) {
+	// synthetic: no file, no inputs → empty eventPath, marked synthetic
+	if p, tmp, sum, err := buildEvent(Options{EventName: "push"}); err != nil || p != "" || tmp != "" || !sum.Synthetic {
+		t.Errorf("synthetic: p=%q tmp=%q sum=%+v err=%v", p, tmp, sum, err)
+	}
+
+	// inputs only: still no event file (act builds {"inputs":…} from Config.Inputs)
+	if p, tmp, _, err := buildEvent(Options{EventName: "workflow_dispatch", Inputs: map[string]string{"x": "1"}}); err != nil || p != "" || tmp != "" {
+		t.Errorf("inputs-only: p=%q tmp=%q err=%v", p, tmp, err)
+	}
+
+	// event file only: passed through as-is, not synthetic
+	dir := t.TempDir()
+	ef := filepath.Join(dir, "event.json")
+	if err := os.WriteFile(ef, []byte(`{"action":"opened"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if p, tmp, sum, err := buildEvent(Options{EventName: "pull_request", EventPath: ef}); err != nil || p != ef || tmp != "" || sum.Synthetic {
+		t.Errorf("file-only: p=%q tmp=%q sum=%+v err=%v", p, tmp, sum, err)
+	}
+
+	// event file + inputs: merged into a temp file with inputs present
+	p, tmp, _, err := buildEvent(Options{EventName: "workflow_dispatch", EventPath: ef, Inputs: map[string]string{"env": "prod"}})
+	if err != nil || p == "" || p != tmp {
+		t.Fatalf("merge: p=%q tmp=%q err=%v", p, tmp, err)
+	}
+	defer os.Remove(tmp)
+	var got map[string]any
+	raw, _ := os.ReadFile(tmp)
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := got["inputs"].(map[string]any)
+	if inputs["env"] != "prod" || got["action"] != "opened" {
+		t.Errorf("merged event wrong: %v", got)
+	}
+
+	// missing event file → error
+	if _, _, _, err := buildEvent(Options{EventPath: filepath.Join(dir, "nope.json")}); err == nil {
+		t.Error("missing event file should error")
+	}
+}
+
+// TestBuildGitHubContext maps overrides to act's env keys (sha → SHA_REF) and lists
+// which fields were overridden; unset fields are left empty for act to derive.
+func TestBuildGitHubContext(t *testing.T) {
+	env, sum := buildGitHubContext(Options{Repository: "o/r", Ref: "refs/heads/x", Sha: "0123456789abcdef", Actor: "me"})
+	if env["GITHUB_REPOSITORY"] != "o/r" || env["GITHUB_REF"] != "refs/heads/x" || env["SHA_REF"] != "0123456789abcdef" {
+		t.Errorf("env wrong: %v", env)
+	}
+	if sum.Sha != "0123456" {
+		t.Errorf("sha not shortened for display: %q", sum.Sha)
+	}
+	if strings.Join(sum.Overridden, ",") != "repository,ref,sha,actor" {
+		t.Errorf("overridden wrong: %v", sum.Overridden)
+	}
+
+	// nothing set → empty env, no overrides
+	if env, sum := buildGitHubContext(Options{}); len(env) != 0 || len(sum.Overridden) != 0 {
+		t.Errorf("empty: env=%v sum=%+v", env, sum)
+	}
+}
+
+// TestRuntimeContextWiring checks New threads the §4 runtime-context options into
+// the Session summaries the TUI reads (token, event, github.* context).
+func TestRuntimeContextWiring(t *testing.T) {
+	s, err := New(Options{
+		WorkflowPath: sampleWorkflow,
+		Workdir:      t.TempDir(),
+		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_x"},
+		Repository:   "o/r",
+		Ref:          "refs/heads/feature",
+		Sha:          "deadbeefcafebabe",
+		Actor:        "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok := s.TokenSummary(); !tok.Present || tok.Source != "secret" {
+		t.Errorf("token summary = %+v, want present from secret", tok)
+	}
+	ghc := s.GitHubContextSummary()
+	if ghc.Repository != "o/r" || ghc.Ref != "refs/heads/feature" || ghc.Sha != "deadbee" || ghc.Actor != "alice" {
+		t.Errorf("ghc summary = %+v", ghc)
+	}
+	if len(ghc.Overridden) != 4 {
+		t.Errorf("want all 4 fields overridden, got %v", ghc.Overridden)
+	}
+	if ev := s.EventSummary(); !ev.Synthetic || ev.EventName != "push" {
+		t.Errorf("event summary = %+v, want synthetic push", ev)
+	}
+}
+
+// TestInputsFixture guards the inputs.yml sample: as a workflow_dispatch it declares
+// three inputs, omitted ones are reported as using their declared default, and a
+// supplied input moves from defaults to provided.
+func TestInputsFixture(t *testing.T) {
+	const wf = "../../testdata/workflows/inputs.yml"
+
+	// no -input → all three declared inputs use their defaults
+	s, err := New(Options{WorkflowPath: wf, EventName: "workflow_dispatch", Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := s.InputsSummary()
+	if !in.Declared || len(in.Defaults) != 3 || len(in.Provided) != 0 {
+		t.Errorf("no-input summary = %+v, want 3 defaulted, 0 provided", in)
+	}
+
+	// supplying one input moves it to provided, leaving two defaulted
+	s2, err := New(Options{WorkflowPath: wf, EventName: "workflow_dispatch", Workdir: t.TempDir(),
+		Inputs: map[string]string{"environment": "production"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in2 := s2.InputsSummary()
+	if in2.Provided["environment"] != "production" || len(in2.Defaults) != 2 {
+		t.Errorf("one-input summary = %+v, want environment provided + 2 defaulted", in2)
+	}
+}
+
+// TestTokenFixture guards the token.yml sample: it parses, and a supplied
+// GITHUB_TOKEN secret surfaces as a present github.token.
+func TestTokenFixture(t *testing.T) {
+	s, err := New(Options{
+		WorkflowPath: "../../testdata/workflows/token.yml",
+		Workdir:      t.TempDir(),
+		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_fixture"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok := s.TokenSummary(); !tok.Present || tok.Source != "secret" {
+		t.Errorf("token summary = %+v, want present from secret", tok)
 	}
 }
