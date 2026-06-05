@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -108,6 +109,58 @@ func TestModelFlow(t *testing.T) {
 		t.Errorf("done view missing 'run complete':\n%s", got)
 	}
 }
+
+// TestLogScroll drives the scrollable LOGS pane: it follows the tail while at
+// the bottom, PgUp parks it on earlier output (no longer at bottom), and End
+// returns it to the tail.
+func TestLogScroll(t *testing.T) {
+	sess, err := debugger.New(debugger.Options{
+		WorkflowPath: "../../testdata/workflows/sample.yml",
+		Workdir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var m tea.Model = New(sess, func() {})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	// More lines than the pane is tall, so the buffer overflows the viewport.
+	for i := 0; i < 200; i++ {
+		m, _ = m.Update(logMsg(lineLabel(i)))
+	}
+
+	// Following the tail: the newest line shows, the oldest does not.
+	if got := m.View(); !strings.Contains(got, lineLabel(199)) {
+		t.Errorf("tail not followed — newest line missing:\n%s", got)
+	}
+	if got := m.View(); strings.Contains(got, lineLabel(0)) {
+		t.Errorf("viewport should not show the oldest line while tailing:\n%s", got)
+	}
+
+	// PgUp scrolls back: now off the bottom and the newest line is out of view.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if mm := m.(Model); mm.logVP.AtBottom() {
+		t.Error("PgUp should leave the viewport off the bottom")
+	}
+	if got := m.View(); strings.Contains(got, lineLabel(199)) {
+		t.Errorf("after PgUp the newest line should be scrolled out:\n%s", got)
+	}
+	if got := m.View(); !strings.Contains(got, "End to follow") {
+		t.Errorf("scrolled-up hint missing:\n%s", got)
+	}
+
+	// End returns to the tail.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if mm := m.(Model); !mm.logVP.AtBottom() {
+		t.Error("End should return the viewport to the bottom")
+	}
+	if got := m.View(); !strings.Contains(got, lineLabel(199)) {
+		t.Errorf("End did not return to the tail:\n%s", got)
+	}
+}
+
+func lineLabel(i int) string { return "log-line-" + strconv.Itoa(i) }
 
 // TestConfigLine locks the redacted config banner: counts and names appear,
 // values never do.

@@ -269,7 +269,7 @@ func run(opts debugger.Options) error {
 	defer cancel()
 	sess.Start(ctx)
 
-	p := tea.NewProgram(tui.New(sess, cancel), tea.WithAltScreen())
+	p := tea.NewProgram(tui.New(sess, cancel), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = p.Run()
 	return err
 }

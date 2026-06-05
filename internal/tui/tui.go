@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -64,6 +65,7 @@ type Model struct {
 	curErr error
 
 	logs    []string
+	logVP   viewport.Model // scrollable LOGS pane; m.logs is its backing buffer
 	runErr  error
 	showEnv bool // env pane instead of log pane
 
@@ -80,6 +82,13 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 	for _, st := range sess.Steps() {
 		labels = append(labels, st.String())
 	}
+	// Disable the viewport's built-in keymap: its defaults (d, u, b, f, pgup…)
+	// would collide with actl's keys (d=shell, b=break, …). We drive scrolling
+	// explicitly and let it keep only mouse-wheel handling. Seed it with the same
+	// fallback size paneWidth/logViewportHeight use so it renders before the first
+	// WindowSizeMsg; real dimensions arrive with that message.
+	vp := viewport.New(76, 8)
+	vp.KeyMap = viewport.KeyMap{}
 	return Model{
 		sess:        sess,
 		cancel:      cancel,
@@ -88,6 +97,7 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 		notices:     noticeLines(sess),
 		state:       stateRunning,
 		cur:         -1,
+		logVP:       vp,
 		breakpoints: make(map[int]bool),
 		tempBreak:   -1,
 	}
@@ -255,6 +265,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.logVP.Width = m.paneWidth()
+		m.logVP.Height = m.logViewportHeight()
+		m.setLogContent()
+		return m, nil
+
+	case tea.MouseMsg:
+		// Wheel scrolls the logs, but only while the LOGS pane is showing.
+		if !m.showEnv {
+			var cmd tea.Cmd
+			m.logVP, cmd = m.logVP.Update(msg)
+			return m, cmd
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -300,10 +322,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			m.showEnv = !m.showEnv
 			return m, nil
+		case "pgup":
+			m.logVP.PageUp()
+			return m, nil
+		case "pgdown":
+			m.logVP.PageDown()
+			return m, nil
+		case "ctrl+u":
+			m.logVP.HalfPageUp()
+			return m, nil
+		case "ctrl+d":
+			m.logVP.HalfPageDown()
+			return m, nil
+		case "home":
+			m.logVP.GotoTop()
+			return m, nil
+		case "end":
+			m.logVP.GotoBottom()
+			return m, nil
 		case "i":
 			if m.state == statePaused {
 				if m.sess.CurrentRun() == "" {
-					m.logs = append(m.logs, "edit: only run: steps have a command to edit")
+					m.appendLog("edit: only run: steps have a command to edit")
 					return m, nil
 				}
 				return m, m.editCmd(editRun, m.sess.CurrentRun())
@@ -315,10 +355,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if m.state == statePaused {
 				if !m.sess.CanRerun() {
-					m.logs = append(m.logs, "rerun: available only after a step has run (step onto it first)")
+					m.appendLog("rerun: available only after a step has run (step onto it first)")
 					return m, nil
 				}
-				m.logs = append(m.logs, fmt.Sprintf("re-running step %d…", m.cur+1))
+				m.appendLog(fmt.Sprintf("re-running step %d…", m.cur+1))
 				return m, m.rerunCmd()
 			}
 		case "d":
@@ -348,10 +388,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case logMsg:
-		m.logs = append(m.logs, string(msg))
-		if len(m.logs) > 2000 {
-			m.logs = m.logs[len(m.logs)-2000:]
-		}
+		m.appendLog(string(msg))
 		return m, m.waitLog
 
 	case logsDoneMsg:
@@ -359,13 +396,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case shellDoneMsg:
 		if msg.err != nil {
-			m.logs = append(m.logs, "shell: "+msg.err.Error())
+			m.appendLog("shell: "+msg.err.Error())
 		}
 		return m, nil
 
 	case rerunDoneMsg:
 		if msg.err != nil {
-			m.logs = append(m.logs, "rerun: "+msg.err.Error())
+			m.appendLog("rerun: "+msg.err.Error())
 		}
 		return m, nil
 
@@ -435,7 +472,15 @@ func (m Model) View() string {
 		}
 		b.WriteString(paneStyle.Width(m.paneWidth()).Render(title+"\n"+m.envPane()) + "\n")
 	} else {
-		b.WriteString(paneStyle.Width(m.paneWidth()).Render("LOGS\n"+m.logTail()) + "\n")
+		title := "LOGS"
+		if !m.logVP.AtBottom() {
+			title += dimStyle.Render("  ↑ scrolled · End to follow")
+		}
+		body := m.logVP.View()
+		if len(m.logs) == 0 {
+			body = dimStyle.Render("(no output yet)")
+		}
+		b.WriteString(paneStyle.Width(m.paneWidth()).Render(title+"\n"+body) + "\n")
 	}
 
 	b.WriteString(m.statusLine())
@@ -468,10 +513,10 @@ func (m Model) runToCursor() (tea.Model, tea.Cmd) {
 	target := m.cursor
 	switch {
 	case target == m.cur && m.curAt == debugger.Before:
-		m.logs = append(m.logs, "run-to-cursor: already stopped before this step")
+		m.appendLog("run-to-cursor: already stopped before this step")
 		return m, nil
 	case target <= m.cur:
-		m.logs = append(m.logs, "run-to-cursor: target is behind the current step — can't run backward")
+		m.appendLog("run-to-cursor: target is behind the current step — can't run backward")
 		return m, nil
 	}
 	// Arm a temp breakpoint unless the user already has a real one there (which
@@ -480,7 +525,7 @@ func (m Model) runToCursor() (tea.Model, tea.Cmd) {
 		m.tempBreak = target
 		m.sess.SetBreakpoint(target, true)
 	}
-	m.logs = append(m.logs, fmt.Sprintf("running to step %d: %s", target+1, m.stepLabel(target)))
+	m.appendLog(fmt.Sprintf("running to step %d: %s", target+1, m.stepLabel(target)))
 	m.sess.Continue()
 	m.state = stateRunning
 	return m, m.waitPause
@@ -523,13 +568,13 @@ func (m Model) editCmd(kind editKind, initial string) tea.Cmd {
 
 func (m *Model) applyEdit(msg editDoneMsg) {
 	if msg.err != nil {
-		m.logs = append(m.logs, "edit: "+msg.err.Error())
+		m.appendLog("edit: "+msg.err.Error())
 		return
 	}
 	switch msg.kind {
 	case editRun:
 		m.sess.SetRun(strings.TrimRight(msg.content, "\n"))
-		m.logs = append(m.logs, "edited step command (in memory) — press r to rerun")
+		m.appendLog("edited step command (in memory) — press r to rerun")
 	case editEnv:
 		n := 0
 		for _, line := range strings.Split(msg.content, "\n") {
@@ -542,7 +587,7 @@ func (m *Model) applyEdit(msg editDoneMsg) {
 				n++
 			}
 		}
-		m.logs = append(m.logs, fmt.Sprintf("applied %d env var(s) (in memory) — press r to rerun", n))
+		m.appendLog(fmt.Sprintf("applied %d env var(s) (in memory) — press r to rerun", n))
 	}
 }
 
@@ -580,7 +625,7 @@ func (m Model) envPane() string {
 	}
 	sort.Strings(keys)
 
-	limit := m.logHeight()
+	limit := m.logViewportHeight()
 	var b strings.Builder
 	for i, k := range keys {
 		if i >= limit {
@@ -599,24 +644,36 @@ func (m Model) paneWidth() int {
 	return 76
 }
 
-func (m Model) logTail() string {
-	n := m.logHeight()
-	logs := m.logs
-	if len(logs) > n {
-		logs = logs[len(logs)-n:]
+// appendLog adds one line to the log buffer (capped) and refreshes the viewport.
+// All log writes — streamed core output and the TUI's own status notes — go
+// through here so the scrollable view stays in sync.
+func (m *Model) appendLog(line string) {
+	m.logs = append(m.logs, line)
+	if len(m.logs) > 2000 {
+		m.logs = m.logs[len(m.logs)-2000:]
 	}
-	if len(logs) == 0 {
-		return dimStyle.Render("(no output yet)")
-	}
-	return strings.Join(logs, "\n")
+	m.setLogContent()
 }
 
-func (m Model) logHeight() int {
-	// total height minus title, two pane borders, step list, status
-	used := len(m.labels) + 9
+// setLogContent pushes the buffer into the viewport, following the tail unless
+// the user has scrolled up — then their position is preserved as lines arrive.
+func (m *Model) setLogContent() {
+	follow := m.logVP.AtBottom()
+	m.logVP.SetContent(strings.Join(m.logs, "\n"))
+	if follow {
+		m.logVP.GotoBottom()
+	}
+}
+
+// logViewportHeight is the row budget for the bottom pane's scrollable area:
+// total height minus the title, transparency notices, the blank spacer, the
+// STEPS pane (border + title + one row per step), the LOGS pane chrome
+// (border + title), and the two-line status block.
+func (m Model) logViewportHeight() int {
+	used := 1 + len(m.notices) + 1 + (len(m.labels) + 3) + 3 + 2
 	h := m.height - used
-	if h < 5 {
-		return 8
+	if h < 3 {
+		return 3
 	}
 	return h
 }
@@ -629,9 +686,9 @@ func (m Model) statusLine() string {
 			where += errStyle.Render(" — step failed: " + m.curErr.Error())
 		}
 		return statusStyle.Render("⏸  paused "+where) +
-			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · g to-cursor · i edit-cmd · E edit-env · r rerun · e env · d shell · q quit")
+			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · g to-cursor · i edit-cmd · E edit-env · r rerun · e env · d shell · PgUp/PgDn scroll · q quit")
 	case stateRunning:
-		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  ↑↓ nav · b break · q quit")
+		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  ↑↓ nav · b break · PgUp/PgDn scroll · q quit")
 	default:
 		if m.runErr != nil {
 			return errStyle.Render("✖  run failed: "+m.runErr.Error()) + dimStyle.Render("   ·  [q]uit")
