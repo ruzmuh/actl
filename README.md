@@ -111,6 +111,19 @@ a workspace is mounted.
 go run ./cmd/actl -workdir . path/to/workflow.yml
 ```
 
+### Checkout
+
+A default `actions/checkout` (no `ref`/`repository`/`path`) would clone a remote over the
+workspace — losing your local changes. `actl` **intercepts** it: it copies your working tree
+(current dir, or `-source DIR`) into the workspace at the checkout step's position, honouring
+`.gitignore` and without mounting (no host writes). Steps before checkout still see an empty
+workspace, exactly as on GitHub; steps after see your code, including uncommitted changes. A
+checkout pinned to another repo/ref/path is left as a real clone.
+
+```sh
+go run ./cmd/actl testdata/workflows/checkout.yml
+```
+
 `go test ./...` runs the tests (no Docker needed).
 
 ## Roadmap
@@ -119,9 +132,9 @@ See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md).
 library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI (step/inspect/shell/
 edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓ →
 run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:` (node / docker / composite) ✓ →
-workspace mount for local actions (`-workdir`) ✓.
-Next: faithful `actions/checkout` (use the local working tree) → ambient identity
-substitution → full multi-job graph → upstream the hook.
+workspace mount for local actions (`-workdir`) ✓ → faithful `actions/checkout` (copies your
+local working tree) ✓.
+Next: ambient identity substitution → full multi-job graph → upstream the hook(s).
 
 ## License
 

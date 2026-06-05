@@ -66,6 +66,7 @@ type Options struct {
 	WithDeps     bool                  // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
 	Image        string                // docker image mapped to ubuntu-latest (default catthehacker)
 	Workdir      string                // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
+	Source       string                // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
 	Secrets      map[string]string     // secrets exposed to the workflow
 	Env          map[string]string     // extra env for containers
 	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
@@ -112,15 +113,18 @@ type control struct {
 
 // Session is one debug run of a single job. Construct with New, then Start.
 type Session struct {
-	jobID      string
-	steps      []*model.Step
-	needs      []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
-	withDeps   bool           // upstream needs run for real before the target job
-	isolatedWS bool           // workspace is an empty temp dir (no user repo) → local actions won't resolve
-	workspace  string         // the bind-mounted workspace path when not isolated (empty otherwise)
-	runner     runner.Runner
-	plan       *model.Plan
-	tmpDir     string // non-empty if we created (and must clean up) the workdir
+	jobID          string
+	steps          []*model.Step
+	needs          []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
+	withDeps       bool           // upstream needs run for real before the target job
+	isolatedWS     bool           // workspace is an empty temp dir (no user repo) → local actions won't resolve
+	workspace      string         // the bind-mounted workspace path (empty unless -workdir given)
+	checkouts      map[int]bool   // step indices of intercepted default checkouts (rewritten to no-ops)
+	checkoutLabels []string       // their labels, for transparency
+	checkoutSource string         // host tree copied into the workspace at checkout (empty unless copy mode)
+	runner         runner.Runner
+	plan           *model.Plan
+	tmpDir         string // non-empty if we created (and must clean up) the workdir
 
 	pauses  chan PauseEvent
 	resume  chan control
@@ -190,20 +194,44 @@ func New(opts Options) (*Session, error) {
 		needs = seedNeeds(run, opts.Needs)
 	}
 
+	// Faithful local checkout: a default `actions/checkout` (no ref/repository/
+	// path) would clone a remote over the workspace, losing your local changes.
+	// Rewrite it to a no-op and, when we have a source tree, populate the
+	// workspace from it at the checkout step's position (see barrier) — so steps
+	// before checkout still see an empty workspace, exactly as on GitHub.
+	// Checkouts with inputs are left as a real clone.
+	checkouts := interceptCheckouts(run.Job().Steps)
+
 	workdir := opts.Workdir
-	var tmpDir string
-	if workdir == "" {
-		// act copies the workdir into the container; an empty temp dir keeps the
-		// repo (incl. the act submodule) out of the container.
-		workdir, err = os.MkdirTemp("", "actl-")
-		if err != nil {
+	var tmpDir, bindWS, checkoutSource string
+	switch {
+	case workdir != "":
+		// explicit bind: the mounted tree already holds the code, so an intercepted
+		// checkout is a pure no-op (no copy). act maps the container action path
+		// from Config.Workdir, so it must be absolute (act's CLI abs's it too).
+		if workdir, err = filepath.Abs(workdir); err != nil {
+			return nil, fmt.Errorf("debugger: workdir: %w", err)
+		}
+		bindWS = workdir
+	case len(checkouts) > 0:
+		// copy the source tree into the workspace at checkout time (no host mutation).
+		src := opts.Source
+		if src == "" {
+			if src, err = os.Getwd(); err != nil {
+				return nil, fmt.Errorf("debugger: source dir: %w", err)
+			}
+		}
+		if workdir, err = filepath.Abs(src); err != nil {
+			return nil, fmt.Errorf("debugger: source dir: %w", err)
+		}
+		checkoutSource = workdir
+	default:
+		// no workspace needed: an empty temp dir keeps the repo (incl. the act
+		// submodule) out of the container.
+		if workdir, err = os.MkdirTemp("", "actl-"); err != nil {
 			return nil, fmt.Errorf("debugger: temp workdir: %w", err)
 		}
 		tmpDir = workdir
-	} else if workdir, err = filepath.Abs(workdir); err != nil {
-		// act maps the container action path from Config.Workdir, so a relative
-		// path mis-resolves local `uses: ./…` actions (act's CLI abs's it too).
-		return nil, fmt.Errorf("debugger: workdir: %w", err)
 	}
 
 	breakpoints := make(map[int]bool, len(opts.Breakpoints))
@@ -212,21 +240,24 @@ func New(opts Options) (*Session, error) {
 	}
 
 	s := &Session{
-		jobID:       run.JobID,
-		steps:       run.Job().Steps,
-		needs:       needs,
-		withDeps:    opts.WithDeps,
-		isolatedWS:  tmpDir != "", // we created an empty temp workspace (no user repo)
-		workspace:   mountedWorkspace(tmpDir, workdir),
-		plan:        execPlan,
-		tmpDir:      tmpDir,
-		pauses:      make(chan PauseEvent),
-		resume:      make(chan control),
-		logs:        make(chan string, 1024),
-		done:        make(chan struct{}),
-		curMode:     modeStep, // stop at entry (before the first step)
-		breakpoints: breakpoints,
-		breakOnErr:  opts.BreakOnError,
+		jobID:          run.JobID,
+		steps:          run.Job().Steps,
+		needs:          needs,
+		withDeps:       opts.WithDeps,
+		isolatedWS:     tmpDir != "", // we created an empty temp workspace (no user repo)
+		workspace:      bindWS,
+		checkouts:      checkouts,
+		checkoutLabels: checkoutLabelsOf(run.Job().Steps, checkouts),
+		checkoutSource: checkoutSource,
+		plan:           execPlan,
+		tmpDir:         tmpDir,
+		pauses:         make(chan PauseEvent),
+		resume:         make(chan control),
+		logs:           make(chan string, 1024),
+		done:           make(chan struct{}),
+		curMode:        modeStep, // stop at entry (before the first step)
+		breakpoints:    breakpoints,
+		breakOnErr:     opts.BreakOnError,
 	}
 	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done, drop: isGitContextNoise}}
 
@@ -282,6 +313,15 @@ func (s *Session) WorkspaceIsolated() bool { return s.isolatedWS }
 // Workspace returns the bind-mounted workspace path, or empty when isolated. When
 // non-empty, steps run in the container can write to this path on the host.
 func (s *Session) Workspace() string { return s.workspace }
+
+// CheckoutSteps returns the labels of default `actions/checkout` steps that were
+// intercepted (rewritten to no-ops), for a transparency line. Empty when none.
+func (s *Session) CheckoutSteps() []string { return s.checkoutLabels }
+
+// CheckoutSource is the host working tree copied into the workspace at checkout
+// time; empty when there's nothing to copy (e.g. a -workdir mount already holds
+// the code, or there were no intercepted checkouts).
+func (s *Session) CheckoutSource() string { return s.checkoutSource }
 
 // LocalUsesSteps returns the labels of steps that reference a local action
 // (`uses: ./…`) — these need a real workspace (run with a workdir set).
@@ -360,6 +400,17 @@ func (s *Session) send(c control) {
 // goroutine. If policy says pass, it returns immediately; if policy says halt, it
 // emits a PauseEvent and blocks until a control arrives.
 func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) error {
+	// Faithful checkout: copy the source tree into the workspace at the (now
+	// no-op) checkout step's position, before any pause. Earlier steps already
+	// ran on an empty workspace; later steps see the code. Only for the debugged
+	// job (the JobID gate keeps --with-deps upstream jobs out).
+	if s.checkoutSource != "" && info.When == runner.BarrierBefore && info.JobID == s.jobID &&
+		s.checkouts[info.Index] && info.CopyWorkdir != nil {
+		if err := info.CopyWorkdir(ctx); err != nil {
+			s.logf("actl: checkout copy failed: %v", err)
+		}
+	}
+
 	if !s.shouldHalt(info) {
 		return nil
 	}
@@ -504,13 +555,59 @@ func (s *Session) shouldHalt(info runner.StepBarrierInfo) bool {
 	return false
 }
 
-// mountedWorkspace is the bind-mounted workspace path for transparency, or empty
-// when the workspace is an isolated temp dir (tmpDir set).
-func mountedWorkspace(tmpDir, workdir string) string {
-	if tmpDir != "" {
-		return ""
+// isDefaultCheckout reports whether a step is `actions/checkout` with no input
+// that changes which code or where it lands (ref/repository/path). Only those are
+// safe to satisfy from the local working tree; anything else stays a real clone.
+func isDefaultCheckout(st *model.Step) bool {
+	if st.Uses != "actions/checkout" && !strings.HasPrefix(st.Uses, "actions/checkout@") {
+		return false
 	}
-	return workdir
+	for _, k := range []string{"ref", "repository", "path"} {
+		if st.With[k] != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// interceptCheckouts rewrites each default checkout step to a no-op run (so act
+// doesn't clone a remote over the workspace), preserving its label, and returns
+// their indices. The workspace is populated from the source tree at the step's
+// position by the barrier (see CopyWorkdir).
+func interceptCheckouts(steps []*model.Step) map[int]bool {
+	out := map[int]bool{}
+	for i, st := range steps {
+		if !isDefaultCheckout(st) {
+			continue
+		}
+		if st.Name == "" {
+			st.Name = st.Uses // keep the original label visible after we clear Uses
+		}
+		st.Uses = ""
+		st.With = nil
+		st.Run = `echo "actl: checkout intercepted — using your local working tree"`
+		out[i] = true
+	}
+	return out
+}
+
+func checkoutLabelsOf(steps []*model.Step, checkouts map[int]bool) []string {
+	var out []string
+	for i, st := range steps {
+		if checkouts[i] {
+			out = append(out, st.String())
+		}
+	}
+	return out
+}
+
+// logf pushes a one-off line into the captured-output stream (non-blocking, so it
+// never stalls the act goroutine), for notices that aren't act's own logs.
+func (s *Session) logf(format string, args ...any) {
+	select {
+	case s.logs <- fmt.Sprintf(format, args...):
+	default:
+	}
 }
 
 func (s *Session) cleanup() {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nektos/act/pkg/runner"
@@ -48,6 +49,78 @@ func TestUsesSampleParses(t *testing.T) {
 	node := s.Steps()[1]
 	if node.Uses == "" || node.Run != "" {
 		t.Errorf("step 2 should be a uses: step, got Uses=%q Run=%q", node.Uses, node.Run)
+	}
+}
+
+// TestInterceptCheckout covers faithful local checkout: a default actions/checkout
+// is rewritten to a no-op and copied from the source tree, while a checkout pinned
+// to another repo/ref is left as a real clone.
+func TestInterceptCheckout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "co.yml")
+	const wf = `name: checkout
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: pinned
+        uses: actions/checkout@v4
+        with:
+          repository: other/repo
+      - run: cat README.md
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Source: t.TempDir()}) // copy mode (default checkout present)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// default checkout (step 0) -> no-op run, recorded; source set
+	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
+		t.Errorf("default checkout not rewritten: Uses=%q Run=%q", got.Uses, got.Run)
+	}
+	if labels := s.CheckoutSteps(); len(labels) != 1 || labels[0] != "checkout" {
+		t.Errorf("CheckoutSteps = %v, want [checkout]", labels)
+	}
+	if s.CheckoutSource() == "" {
+		t.Error("CheckoutSource empty, want the source tree path")
+	}
+
+	// pinned checkout (step 1) -> untouched real clone
+	if got := s.Steps()[1]; !strings.HasPrefix(got.Uses, "actions/checkout") {
+		t.Errorf("pinned checkout was altered: Uses=%q", got.Uses)
+	}
+}
+
+// TestCheckoutNoCopyWhenBound: with an explicit -workdir mount, an intercepted
+// checkout is a pure no-op (the mount already holds the code) — no source copy.
+func TestCheckoutNoCopyWhenBound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "co.yml")
+	const wf = `name: checkout
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo hi
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.CheckoutSteps()) != 1 {
+		t.Fatalf("checkout not intercepted under -workdir: %v", s.CheckoutSteps())
+	}
+	if s.CheckoutSource() != "" {
+		t.Errorf("CheckoutSource = %q, want empty (mounted workspace, no copy)", s.CheckoutSource())
 	}
 }
 

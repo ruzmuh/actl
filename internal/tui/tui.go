@@ -98,13 +98,22 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 // and the job has local actions that therefore won't resolve.
 func noticeLines(sess *debugger.Session) []string {
 	lines := needsLines(sess.NeedsSummary())
+	if ws := sess.Workspace(); ws != "" {
+		lines = append(lines, fmt.Sprintf("workspace %s is mounted — steps run in the container can write to it", ws))
+	}
 	if sess.WorkspaceIsolated() {
 		if locals := sess.LocalUsesSteps(); len(locals) > 0 {
 			lines = append(lines, fmt.Sprintf("empty workspace — %d local action(s) won't resolve; mount your repo with -workdir . : %s",
 				len(locals), strings.Join(locals, ", ")))
 		}
-	} else {
-		lines = append(lines, fmt.Sprintf("workspace %s is mounted — steps run in the container can write to it", sess.Workspace()))
+	}
+	if steps := sess.CheckoutSteps(); len(steps) > 0 {
+		if src := sess.CheckoutSource(); src != "" {
+			lines = append(lines, fmt.Sprintf("checkout intercepted (%s) — copies your working tree %s (.gitignore respected)",
+				strings.Join(steps, ", "), src))
+		} else {
+			lines = append(lines, fmt.Sprintf("checkout intercepted (%s) — using the mounted workspace", strings.Join(steps, ", ")))
+		}
 	}
 	return lines
 }

@@ -1,0 +1,30 @@
+# Demonstrates faithful local actions/checkout. The default checkout is
+# intercepted: instead of cloning a remote, actl copies your working tree into
+# the workspace at the checkout step's position — so the step BEFORE checkout
+# sees an empty workspace (as on GitHub) and the step AFTER sees your code,
+# including uncommitted changes. .gitignore is respected.
+#
+#   # copies the current dir (your repo) at checkout:
+#   go run ./cmd/actl testdata/workflows/checkout.yml
+#
+#   # copy a specific (smaller) tree instead of the current dir:
+#   go run ./cmd/actl -source testdata/workspace testdata/workflows/checkout.yml
+#
+# A checkout pinned to another repo/ref/path is left as a real clone.
+name: checkout
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: before checkout
+        run: |
+          echo "workspace before checkout (empty, like on GitHub):"
+          ls -A
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: after checkout
+        run: |
+          echo "workspace after checkout (your working tree):"
+          ls -A
