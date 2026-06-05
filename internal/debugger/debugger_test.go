@@ -341,6 +341,135 @@ jobs:
 	}
 }
 
+// TestInterceptGCPAuth covers detection + rewrite of google-github-actions/auth:
+// the step becomes a no-op run (so it can't federate), keeps a visible label, and
+// its declared federation target is captured before With is cleared.
+func TestInterceptGCPAuth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gcp.yml")
+	const wf = `name: gcp
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          service_account: sa@proj.iam.gserviceaccount.com
+          workload_identity_provider: projects/1/locations/global/workloadIdentityPools/p/providers/x
+      - run: gcloud projects describe proj
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir(),
+		GCP: &GCPIdentity{CredentialFile: "/tmp/adc.json", AccessToken: "ya29.x", Account: "me@example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// auth step (0) -> no-op run, recorded
+	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
+		t.Errorf("auth step not rewritten: Uses=%q Run=%q", got.Uses, got.Run)
+	}
+	sum := s.GCPSummary()
+	if len(sum.Steps) != 1 || sum.Steps[0] != "google-github-actions/auth@v2" {
+		t.Errorf("GCPSummary.Steps = %v, want [google-github-actions/auth@v2]", sum.Steps)
+	}
+	want := "sa@proj.iam.gserviceaccount.com via projects/1/locations/global/workloadIdentityPools/p/providers/x"
+	if len(sum.Targets) != 1 || sum.Targets[0] != want {
+		t.Errorf("GCPSummary.Targets = %v, want [%q]", sum.Targets, want)
+	}
+	if !sum.File || !sum.Token || sum.Account != "me@example.com" {
+		t.Errorf("GCPSummary = %+v, want File+Token+account", sum)
+	}
+
+	// the credential bind that act mounts into the job container.
+	if got := gcpBind(&GCPIdentity{CredentialFile: "/tmp/adc.json"}, true); !strings.Contains(got, "/tmp/adc.json:"+gcpCredsContainerPath+":ro") {
+		t.Errorf("gcpBind = %q, want the ro credential bind", got)
+	}
+
+	// env injected into the live map at the auth step's position. Note we set neither
+	// GOOGLE_GHA_CREDS_PATH (setup-gcloud would --cred-file an authorized_user ADC and
+	// fail) nor any project (that's the workflow's concern, not the host's).
+	if env := s.gcpEnv; env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath ||
+		env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "ya29.x" {
+		t.Errorf("gcpEnv = %v, want the credential contract", s.gcpEnv)
+	}
+	for _, k := range []string{"GOOGLE_GHA_CREDS_PATH", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"} {
+		if _, ok := s.gcpEnv[k]; ok {
+			t.Errorf("%s must not be set", k)
+		}
+	}
+}
+
+// TestGCPNoIdentity: an auth step with no ambient credentials is still neutralized
+// (so the job survives), but nothing is injected and the summary says so.
+func TestGCPNoIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gcp.yml")
+	const wf = `name: gcp
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+      - run: echo hi
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir()}) // GCP nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
+		t.Errorf("auth step should still be neutralized without creds: Uses=%q", got.Uses)
+	}
+	sum := s.GCPSummary()
+	if len(sum.Steps) != 1 || sum.File || sum.Token {
+		t.Errorf("GCPSummary = %+v, want one step and nothing injected", sum)
+	}
+	if len(s.gcpEnv) != 0 {
+		t.Errorf("gcpEnv = %v, want empty without creds", s.gcpEnv)
+	}
+	if got := gcpBind(nil, true); got != "" {
+		t.Errorf("gcpBind(nil) = %q, want empty without a credential file", got)
+	}
+}
+
+// TestBuildGCP unit-tests the env/summary assembly directly across the partial-creds
+// cases (token-only, file-only) without touching act.
+func TestBuildGCP(t *testing.T) {
+	steps := map[int]bool{2: true}
+	targets := []string{"sa via wip"}
+
+	// no auth steps -> empty, even with an identity
+	if env, sum := buildGCP(&GCPIdentity{AccessToken: "t"}, nil, nil); env != nil || len(sum.Steps) != 0 || sum.Token {
+		t.Errorf("no steps: env=%v sum=%+v, want empty", env, sum)
+	}
+
+	// token only -> CLOUDSDK token, no file
+	env, sum := buildGCP(&GCPIdentity{AccessToken: "tok"}, steps, targets)
+	if env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "tok" || sum.Token != true || sum.File {
+		t.Errorf("token-only: env=%v sum=%+v", env, sum)
+	}
+	if _, ok := env["GOOGLE_APPLICATION_CREDENTIALS"]; ok {
+		t.Error("token-only should not set GOOGLE_APPLICATION_CREDENTIALS")
+	}
+
+	// file only -> the GOOGLE_* contract, no token
+	env, sum = buildGCP(&GCPIdentity{CredentialFile: "/x"}, steps, targets)
+	if env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath || !sum.File || sum.Token {
+		t.Errorf("file-only: env=%v sum=%+v", env, sum)
+	}
+
+	// targets carried through regardless of identity
+	if len(sum.Targets) != 1 || sum.Targets[0] != "sa via wip" {
+		t.Errorf("targets = %v, want carried through", sum.Targets)
+	}
+}
+
 func TestGitContextNoiseFiltered(t *testing.T) {
 	drop := []string{
 		"path/tmp/actl-123not located inside a git repository",

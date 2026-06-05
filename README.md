@@ -11,7 +11,8 @@ re-run a step — with **faithful `uses:` execution**, because it stands on
 > Working today: single-job debugging through act's real engine — pause before/after
 > every step, env inspector, drop into the live job container, edit a step's command or
 > env and re-run it in place, breakpoints + run-to-cursor, job selection, isolated-run
-> `needs` seeding, and secrets / vars / env loading — each with a transparency line.
+> `needs` seeding, secrets / vars / env loading, and ambient GCP identity substitution
+> — each with a transparency line.
 
 ## Why
 
@@ -146,6 +147,34 @@ checkout pinned to another repo/ref/path is left as a real clone.
 go run ./cmd/actl testdata/workflows/checkout.yml
 ```
 
+### Cloud identity (GCP)
+
+In real CI, `google-github-actions/auth` + `id-token: write` mints a GitHub-signed
+OIDC token and exchanges it for short-lived Google credentials. **Locally there is no
+GitHub OIDC issuer**, so that step can't federate — it would fail and kill the job.
+`actl` **intercepts** it: rewrites it to a no-op and injects your *ambient* gcloud
+Application Default Credentials, so later steps (`gcloud`/`gsutil`, `setup-gcloud`,
+client libraries) run as **you**. The TUI prints a transparency line — what the step
+*would* federate as vs the local identity it runs as — because you're testing under
+your own permissions, not the workflow's federated scope.
+
+```sh
+gcloud auth application-default login        # once, so the ADC file exists
+go run ./cmd/actl testdata/workflows/gcp-auth.yml
+```
+
+It mounts your ADC file read-only into the container and sets
+`GOOGLE_APPLICATION_CREDENTIALS` (so client libraries and terraform discover it) plus
+`CLOUDSDK_AUTH_ACCESS_TOKEN` (so gcloud/gsutil and `setup-gcloud` authenticate). Point
+at a specific credential file with `-gcp-credentials FILE`, or leave the auth step
+untouched (real federation) with `-gcp-identity=false`. The access token lives ~1h; the
+credential file keeps client libraries working past that.
+
+`actl` doesn't inject a **project** — that's the workflow's concern, exactly as on
+GitHub (the command's `--project`, or a `GOOGLE_CLOUD_PROJECT` you pass via `.env` /
+`-env`). A `gcloud` call with no project resolved fails the same way it would in CI
+(*"Project id: 0 is invalid"*). GCP is the first provider; AWS/Azure are on the roadmap.
+
 `go test ./...` runs the tests (no Docker needed).
 
 ## Roadmap
@@ -155,8 +184,9 @@ library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ �
 edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓ →
 run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:` (node / docker / composite) ✓ →
 workspace mount for local actions (`-workdir`) ✓ → faithful `actions/checkout` (copies your
-local working tree) ✓ → secrets / vars / env from act's dotenv triple ✓.
-Next: ambient identity substitution → full multi-job graph → upstream the hook(s).
+local working tree) ✓ → secrets / vars / env from act's dotenv triple ✓ → ambient GCP
+identity substitution (`google-github-actions/auth`) ✓.
+Next: AWS/Azure identity → full multi-job graph → upstream the hook(s).
 
 ## License
 

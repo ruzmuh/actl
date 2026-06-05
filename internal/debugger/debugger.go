@@ -67,6 +67,32 @@ type ConfigSummary struct {
 	Env     []string // env names (sorted)
 }
 
+// GCPIdentity is the host-resolved ambient GCP credentials the CLI passes in for
+// identity substitution (CLAUDE.md §4). Locally there is no GitHub OIDC issuer, so
+// `google-github-actions/auth` can't federate; instead we intercept that step and
+// inject the dev's already-present credentials. The core never shells out to gcloud
+// — discovery/minting is a host concern (cmd/actl); the core only consumes the data.
+type GCPIdentity struct {
+	CredentialFile string // host path to the ADC json, bind-mounted ro into the container
+	AccessToken    string // ambient ADC access token → CLOUDSDK_AUTH_ACCESS_TOKEN
+	Account        string // local identity, for the transparency line (best-effort, may be empty)
+}
+
+// GCPSummary is a redacted view of the GCP identity substitution for a transparency
+// line: which auth steps were intercepted, the federation target each one would have
+// used in real CI, and the local identity we run as instead. No token material is
+// retained here.
+type GCPSummary struct {
+	Steps   []string // intercepted google-github-actions/auth step labels
+	Targets []string // "<service_account> via <workload_identity_provider>" per step (as declared)
+	Account string   // local ambient identity we run as ("" if none was found)
+	File    bool     // an ADC credential file was mounted into the container
+	Token   bool     // an access token was injected
+}
+
+// container path the ambient ADC file is mounted at (matches the env we inject).
+const gcpCredsContainerPath = "/actl/gcp/adc.json"
+
 // Options configures a debug Session. Only WorkflowPath is required.
 type Options struct {
 	WorkflowPath string                // path to the workflow file
@@ -79,6 +105,7 @@ type Options struct {
 	Secrets      map[string]string     // secrets.* exposed to the workflow
 	Vars         map[string]string     // vars.* exposed to the workflow
 	Env          map[string]string     // extra env for containers
+	GCP          *GCPIdentity          // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
 	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
 	BreakOnError bool                  // in Continue mode, halt after a step that errored
 	Breakpoints  []int                 // zero-based step indices to halt before, in Continue mode
@@ -125,14 +152,17 @@ type control struct {
 type Session struct {
 	jobID          string
 	steps          []*model.Step
-	needs          []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
-	withDeps       bool           // upstream needs run for real before the target job
-	isolatedWS     bool           // workspace is an empty temp dir (no user repo) → local actions won't resolve
-	workspace      string         // the bind-mounted workspace path (empty unless -workdir given)
-	checkouts      map[int]bool   // step indices of intercepted default checkouts (rewritten to no-ops)
-	checkoutLabels []string       // their labels, for transparency
-	checkoutSource string         // host tree copied into the workspace at checkout (empty unless copy mode)
-	configSummary  ConfigSummary  // redacted names of supplied secrets/vars/env (for transparency)
+	needs          []NeedsSummary    // how the selected job's needs were satisfied locally (for transparency)
+	withDeps       bool              // upstream needs run for real before the target job
+	isolatedWS     bool              // workspace is an empty temp dir (no user repo) → local actions won't resolve
+	workspace      string            // the bind-mounted workspace path (empty unless -workdir given)
+	checkouts      map[int]bool      // step indices of intercepted default checkouts (rewritten to no-ops)
+	checkoutLabels []string          // their labels, for transparency
+	checkoutSource string            // host tree copied into the workspace at checkout (empty unless copy mode)
+	configSummary  ConfigSummary     // redacted names of supplied secrets/vars/env (for transparency)
+	gcpSteps       map[int]bool      // step indices of intercepted google-github-actions/auth steps
+	gcpEnv         map[string]string // GCP credential env injected at the auth step's position (nil if no identity)
+	gcpSummary     GCPSummary        // redacted view of the GCP identity substitution (for transparency)
 	runner         runner.Runner
 	plan           *model.Plan
 	tmpDir         string // non-empty if we created (and must clean up) the workdir
@@ -213,6 +243,16 @@ func New(opts Options) (*Session, error) {
 	// Checkouts with inputs are left as a real clone.
 	checkouts := interceptCheckouts(run.Job().Steps)
 
+	// Ambient GCP identity substitution (CLAUDE.md §4): a federated
+	// google-github-actions/auth can't mint a GitHub OIDC token locally, so it would
+	// fail and kill the job. Rewrite it to a no-op and inject the dev's ambient
+	// credentials at its position (see barrier). Same intercept-and-substitute shape
+	// as checkout. Intercept whenever the step is present, even without credentials,
+	// so the job still runs (non-cloud steps stay debuggable).
+	gcpSteps, gcpTargets := interceptGCPAuth(run.Job().Steps)
+	gcpEnv, gcpSummary := buildGCP(opts.GCP, gcpSteps, gcpTargets)
+	gcpSummary.Steps = stepLabelsOf(run.Job().Steps, gcpSteps)
+
 	workdir := opts.Workdir
 	var tmpDir, bindWS, checkoutSource string
 	switch {
@@ -258,9 +298,12 @@ func New(opts Options) (*Session, error) {
 		isolatedWS:     tmpDir != "", // we created an empty temp workspace (no user repo)
 		workspace:      bindWS,
 		checkouts:      checkouts,
-		checkoutLabels: checkoutLabelsOf(run.Job().Steps, checkouts),
+		checkoutLabels: stepLabelsOf(run.Job().Steps, checkouts),
 		checkoutSource: checkoutSource,
 		configSummary:  summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
+		gcpSteps:       gcpSteps,
+		gcpEnv:         gcpEnv,
+		gcpSummary:     gcpSummary,
 		plan:           execPlan,
 		tmpDir:         tmpDir,
 		pauses:         make(chan PauseEvent),
@@ -293,6 +336,16 @@ func New(opts Options) (*Session, error) {
 		// actions fail to clone. Set the public default explicitly.
 		GitHubInstance: "github.com",
 		StepBarrier:    s.barrier,
+	}
+	// Make the ambient ADC file visible inside the job container. act parses
+	// ContainerOptions as docker flags, so a read-only volume bind reaches the job
+	// container without a fork patch. Only when there's an auth step to satisfy.
+	if bind := gcpBind(opts.GCP, len(gcpSteps) > 0); bind != "" {
+		if cfg.ContainerOptions == "" {
+			cfg.ContainerOptions = bind
+		} else {
+			cfg.ContainerOptions += " " + bind
+		}
 	}
 	r, err := runner.New(cfg)
 	if err != nil {
@@ -338,6 +391,11 @@ func (s *Session) CheckoutSource() string { return s.checkoutSource }
 // ConfigSummary returns the redacted names of the secrets/vars/env supplied to
 // the run (values withheld), for a transparency line.
 func (s *Session) ConfigSummary() ConfigSummary { return s.configSummary }
+
+// GCPSummary returns the redacted view of the GCP identity substitution (which
+// auth steps were intercepted, the federation target vs the local identity), for a
+// transparency line. Its Steps are empty when the job has no auth step.
+func (s *Session) GCPSummary() GCPSummary { return s.gcpSummary }
 
 // LocalUsesSteps returns the labels of steps that reference a local action
 // (`uses: ./…`) — these need a real workspace (run with a workdir set).
@@ -424,6 +482,16 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 		s.checkouts[info.Index] && info.CopyWorkdir != nil {
 		if err := info.CopyWorkdir(ctx); err != nil {
 			s.logf("actl: checkout copy failed: %v", err)
+		}
+	}
+
+	// Faithful identity: inject the ambient GCP credentials into the live env at the
+	// (now no-op) auth step's position — earlier steps don't see them, later steps
+	// do, exactly as the real auth step would set them. info.Env is the same live
+	// rc.Env map SetEnv mutates, so the change propagates to subsequent execs.
+	if len(s.gcpEnv) > 0 && info.When == runner.BarrierBefore && info.JobID == s.jobID && s.gcpSteps[info.Index] {
+		for k, v := range s.gcpEnv {
+			info.Env[k] = v
 		}
 	}
 
@@ -607,10 +675,109 @@ func interceptCheckouts(steps []*model.Step) map[int]bool {
 	return out
 }
 
-func checkoutLabelsOf(steps []*model.Step, checkouts map[int]bool) []string {
+// isGCPAuth reports whether a step uses google-github-actions/auth (any version).
+func isGCPAuth(st *model.Step) bool {
+	return st.Uses == "google-github-actions/auth" || strings.HasPrefix(st.Uses, "google-github-actions/auth@")
+}
+
+// interceptGCPAuth rewrites each google-github-actions/auth step to a no-op run (so
+// it doesn't try to federate against a GitHub OIDC issuer that doesn't exist
+// locally), preserving its label, and returns their indices plus the federation
+// target each one declared ("<service_account> via <provider>") for transparency.
+// The ambient credentials are injected at the step's position by the barrier.
+func interceptGCPAuth(steps []*model.Step) (map[int]bool, []string) {
+	out := map[int]bool{}
+	var targets []string
+	for i, st := range steps {
+		if !isGCPAuth(st) {
+			continue
+		}
+		targets = append(targets, gcpTarget(st))
+		if st.Name == "" {
+			st.Name = st.Uses // keep the original label visible after we clear Uses
+		}
+		st.Uses = ""
+		st.With = nil
+		st.Run = `echo "actl: GCP auth intercepted — using ambient identity"`
+		out[i] = true
+	}
+	return out, targets
+}
+
+// gcpTarget describes the federation an auth step declares, for the transparency
+// line — read before we clear With. Falls back to a generic label if unset.
+func gcpTarget(st *model.Step) string {
+	sa := st.With["service_account"]
+	wip := st.With["workload_identity_provider"]
+	switch {
+	case sa != "" && wip != "":
+		return sa + " via " + wip
+	case sa != "":
+		return sa
+	case wip != "":
+		return wip
+	default:
+		return "(federated identity)"
+	}
+}
+
+// buildGCP assembles the credential env injected at the auth step's position and a
+// redacted summary for the transparency line. With no identity (id == nil) it
+// returns no env but still summarizes the intercepted steps, so the UI can say the
+// steps were neutralized but cloud calls will fail.
+func buildGCP(id *GCPIdentity, steps map[int]bool, targets []string) (map[string]string, GCPSummary) {
+	summary := GCPSummary{Targets: targets}
+	if len(steps) == 0 {
+		return nil, GCPSummary{} // no auth step → nothing to report
+	}
+	if id == nil {
+		return nil, summary
+	}
+	env := map[string]string{}
+	if id.CredentialFile != "" {
+		// Client libraries (Go/Python/terraform's google provider) discover ADC here.
+		// We deliberately do NOT set GOOGLE_GHA_CREDS_PATH: setup-gcloud consumes it to
+		// run `gcloud auth login --cred-file`, which rejects the authorized_user ADC
+		// that `gcloud auth application-default login` produces ("only external/service
+		// account JSON supported"). The access token below authenticates gcloud
+		// universally instead, so that path is both unnecessary and harmful here.
+		env["GOOGLE_APPLICATION_CREDENTIALS"] = gcpCredsContainerPath
+		summary.File = true
+	}
+	if id.AccessToken != "" {
+		// Authenticates gcloud/gsutil/bq directly (any ADC type), and satisfies
+		// setup-gcloud's own `isAuthenticated()` check so it doesn't warn.
+		env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = id.AccessToken
+		summary.Token = true
+	}
+	// We deliberately do NOT inject a project. In real CI the project comes from the
+	// workflow (the auth step's project_id input, or an explicit --project / env on
+	// the command); fabricating one from the host's gcloud config wouldn't exist on
+	// GitHub. If a run needs GOOGLE_CLOUD_PROJECT, supply it via the generic env path
+	// (.env / -env), same as any other env var.
+	summary.Account = id.Account
+	if len(env) == 0 {
+		env = nil
+	}
+	return env, summary
+}
+
+// gcpBind returns the docker volume option that mounts the ambient ADC file
+// read-only into the job container, or "" when there's no file to mount or no auth
+// step to satisfy. The mount path matches the GOOGLE_APPLICATION_CREDENTIALS env.
+func gcpBind(id *GCPIdentity, hasAuthSteps bool) string {
+	if id == nil || id.CredentialFile == "" || !hasAuthSteps {
+		return ""
+	}
+	return fmt.Sprintf("-v %s:%s:ro", id.CredentialFile, gcpCredsContainerPath)
+}
+
+// stepLabelsOf returns the labels of the steps whose indices are set in mark, in
+// order — used to name intercepted steps (checkout, GCP auth) for transparency.
+func stepLabelsOf(steps []*model.Step, mark map[int]bool) []string {
 	var out []string
 	for i, st := range steps {
-		if checkouts[i] {
+		if mark[i] {
 			out = append(out, st.String())
 		}
 	}

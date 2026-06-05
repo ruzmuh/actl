@@ -13,6 +13,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/ruzmuh/actl/internal/debugger"
 	"github.com/ruzmuh/actl/internal/tui"
+	"github.com/ruzmuh/actl/internal/workflow"
 )
 
 // stringSlice collects a repeatable string flag (e.g. -need a -need b).
@@ -42,6 +45,8 @@ func main() {
 	secretFile := flag.String("secret-file", ".secrets", "dotenv file of secrets.* (skipped if absent; keep it out of git)")
 	varFile := flag.String("var-file", ".vars", "dotenv file of vars.* (skipped if absent)")
 	envFile := flag.String("env-file", ".env", "dotenv file of env vars (skipped if absent)")
+	gcpIdentity := flag.Bool("gcp-identity", true, "substitute ambient gcloud ADC for a federated google-github-actions/auth step (=false leaves it untouched)")
+	gcpCreds := flag.String("gcp-credentials", "", "path to the ADC json to inject (default: discover gcloud's application_default_credentials.json)")
 	var needs, envs, secrets, vars stringSlice
 	flag.Var(&needs, "need", "seed an upstream needs value: 'JOB.outputs.NAME=VALUE' or 'JOB.result=VALUE' (repeatable)")
 	flag.Var(&envs, "env", "set an env var for the run: 'KEY=VALUE' (repeatable, overrides -env-file)")
@@ -78,6 +83,14 @@ func main() {
 		}
 	}
 
+	// Ambient GCP identity: only resolved (and gcloud invoked) when the workflow
+	// actually has a google-github-actions/auth step — kept lazy so non-GCP runs
+	// never shell out. Host concern: the core consumes the resolved data.
+	var gcp *debugger.GCPIdentity
+	if *gcpIdentity {
+		gcp = gatherGCPIdentity(path, *gcpCreds)
+	}
+
 	opts := debugger.Options{
 		WorkflowPath: path,
 		EventName:    *event,
@@ -91,6 +104,7 @@ func main() {
 		Secrets:      secretMap,
 		Vars:         varMap,
 		Env:          envMap,
+		GCP:          gcp,
 	}
 
 	if err := run(opts); err != nil {
@@ -151,6 +165,79 @@ func loadConfig(file string, explicit bool, overrides []string) (map[string]stri
 		return nil, nil
 	}
 	return out, nil
+}
+
+// gatherGCPIdentity resolves the dev's ambient GCP credentials for substitution,
+// but only when the workflow actually has a google-github-actions/auth step — so a
+// non-GCP run never shells out to gcloud. Discovery and token minting are
+// best-effort: a missing piece just narrows what we can inject (the core still
+// neutralizes the auth step and the TUI reports honestly). Returns nil when there's
+// no auth step, or neither a credential file nor a token could be found.
+func gatherGCPIdentity(path, credOverride string) *debugger.GCPIdentity {
+	if !workflowHasGCPAuth(path) {
+		return nil
+	}
+	file := findADCFile(credOverride)
+	token := gcloudValue("auth", "application-default", "print-access-token")
+	if file == "" && token == "" {
+		return nil
+	}
+	return &debugger.GCPIdentity{
+		CredentialFile: file,
+		AccessToken:    token,
+		Account:        gcloudValue("config", "get-value", "account"),
+	}
+}
+
+// workflowHasGCPAuth reports whether any job in the workflow uses
+// google-github-actions/auth (a cheap pre-scan to keep gcloud invocation lazy).
+func workflowHasGCPAuth(path string) bool {
+	wf, err := workflow.Load(path, true)
+	if err != nil {
+		return false // a real parse error surfaces later in debugger.New
+	}
+	for _, job := range wf.Jobs {
+		for _, st := range job.Steps {
+			if st.Uses == "google-github-actions/auth" || strings.HasPrefix(st.Uses, "google-github-actions/auth@") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// findADCFile locates the Application Default Credentials json, preferring an
+// explicit override, then $GOOGLE_APPLICATION_CREDENTIALS, then gcloud's well-known
+// path under $CLOUDSDK_CONFIG or $HOME. Returns "" if none exists. Pure (no gcloud),
+// so it's unit-testable.
+func findADCFile(override string) string {
+	const adcName = "application_default_credentials.json"
+	candidates := []string{override, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")}
+	if cfg := os.Getenv("CLOUDSDK_CONFIG"); cfg != "" {
+		candidates = append(candidates, filepath.Join(cfg, adcName))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".config", "gcloud", adcName))
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+// gcloudValue runs `gcloud <args...>` and returns the trimmed stdout, or "" on any
+// error (gcloud absent, not logged in, etc.) — every caller is best-effort.
+func gcloudValue(args ...string) string {
+	out, err := exec.Command("gcloud", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // parseKeyVals turns 'KEY=VALUE' entries into a map (later wins on duplicates).

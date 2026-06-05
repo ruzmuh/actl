@@ -125,3 +125,43 @@ func TestConfigLine(t *testing.T) {
 		t.Error("empty summary should render no line")
 	}
 }
+
+// TestGCPLines locks the identity transparency: the federation target vs the local
+// identity, what was injected, and the honest no-credentials case.
+func TestGCPLines(t *testing.T) {
+	// full substitution: a federation line + the mounted-file/token line
+	full := gcpLines(debugger.GCPSummary{
+		Steps:   []string{"auth"},
+		Targets: []string{"sa@p.iam.gserviceaccount.com via prov"},
+		Account: "me@example.com",
+		File:    true,
+		Token:   true,
+	})
+	if len(full) != 3 {
+		t.Fatalf("want 3 lines, got %d: %v", len(full), full)
+	}
+	if !strings.Contains(full[0], "would federate as sa@p.iam.gserviceaccount.com via prov") ||
+		!strings.Contains(full[0], "running locally as me@example.com") {
+		t.Errorf("federation line wrong: %q", full[0])
+	}
+	if !strings.Contains(full[1], "ADC file + access token") {
+		t.Errorf("injection line wrong: %q", full[1])
+	}
+	if !strings.Contains(full[2], "GOOGLE_CLOUD_PROJECT") {
+		t.Errorf("project-hint line wrong: %q", full[2])
+	}
+
+	// no credentials: still names the step, but says cloud calls will fail
+	none := gcpLines(debugger.GCPSummary{Steps: []string{"auth"}, Targets: []string{"sa via prov"}})
+	if len(none) != 2 || !strings.Contains(none[1], "no ambient credentials") {
+		t.Errorf("no-creds lines wrong: %v", none)
+	}
+	if !strings.Contains(none[0], "your ambient gcloud identity") {
+		t.Errorf("missing-account fallback wrong: %q", none[0])
+	}
+
+	// no auth step: nothing rendered
+	if got := gcpLines(debugger.GCPSummary{}); got != nil {
+		t.Errorf("no auth step should render nothing, got %v", got)
+	}
+}

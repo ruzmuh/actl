@@ -42,6 +42,44 @@ func TestLoadConfigMissing(t *testing.T) {
 	}
 }
 
+func TestFindADCFile(t *testing.T) {
+	dir := t.TempDir()
+	adc := filepath.Join(dir, "adc.json")
+	if err := os.WriteFile(adc, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// explicit override wins and is returned.
+	if got := findADCFile(adc); got != adc {
+		t.Errorf("override: got %q, want %q", got, adc)
+	}
+
+	// falls back to $GOOGLE_APPLICATION_CREDENTIALS.
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", adc)
+	t.Setenv("CLOUDSDK_CONFIG", "")
+	if got := findADCFile(""); got != adc {
+		t.Errorf("env: got %q, want %q", got, adc)
+	}
+
+	// nothing discoverable -> empty. Point every source at a missing path.
+	missing := filepath.Join(dir, "nope.json")
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", missing)
+	t.Setenv("CLOUDSDK_CONFIG", dir) // dir/application_default_credentials.json absent
+	t.Setenv("HOME", filepath.Join(dir, "empty-home"))
+	if got := findADCFile(missing); got != "" {
+		t.Errorf("missing: got %q, want empty", got)
+	}
+}
+
+func TestWorkflowHasGCPAuth(t *testing.T) {
+	if !workflowHasGCPAuth("../../testdata/workflows/gcp-auth.yml") {
+		t.Error("gcp-auth.yml: want true")
+	}
+	if workflowHasGCPAuth("../../testdata/workflows/config.yml") {
+		t.Error("config.yml: want false (no auth step)")
+	}
+}
+
 func TestParseNeeds(t *testing.T) {
 	in := []string{
 		"build.outputs.image=repo/app:abc",

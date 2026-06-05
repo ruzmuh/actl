@@ -118,6 +118,47 @@ func noticeLines(sess *debugger.Session) []string {
 			lines = append(lines, fmt.Sprintf("checkout intercepted (%s) — using the mounted workspace", strings.Join(steps, ", ")))
 		}
 	}
+	lines = append(lines, gcpLines(sess.GCPSummary())...)
+	return lines
+}
+
+// gcpLines renders the GCP identity substitution: the federation each auth step
+// would have used in real CI vs the local identity we run as, and what we injected.
+// This honest notice is the point of ambient substitution (CLAUDE.md §4). Empty
+// when the job has no google-github-actions/auth step.
+func gcpLines(g debugger.GCPSummary) []string {
+	if len(g.Steps) == 0 {
+		return nil
+	}
+	local := g.Account
+	if local == "" {
+		local = "your ambient gcloud identity"
+	}
+	var lines []string
+	for i, step := range g.Steps {
+		target := "(federated identity)"
+		if i < len(g.Targets) {
+			target = g.Targets[i]
+		}
+		lines = append(lines, fmt.Sprintf("gcp identity (%s): would federate as %s → running locally as %s", step, target, local))
+	}
+	switch {
+	case g.File && g.Token:
+		lines = append(lines, "gcp identity: mounted ambient ADC file + access token into the job")
+	case g.File:
+		lines = append(lines, "gcp identity: mounted ambient ADC file into the job")
+	case g.Token:
+		lines = append(lines, "gcp identity: injected an ambient access token into the job")
+	default:
+		lines = append(lines, "gcp identity: no ambient credentials found — cloud calls will fail (run: gcloud auth application-default login)")
+	}
+	// We authenticate but never set a project (that's the workflow's concern, as on
+	// GitHub) — surface it so a later project-less gcloud/SDK call's failure isn't a
+	// surprise. Only when creds were actually injected; the no-creds case above already
+	// has its own actionable message.
+	if g.File || g.Token {
+		lines = append(lines, "gcp identity: no project set by actl — pass GOOGLE_CLOUD_PROJECT via -env if a step needs one")
+	}
 	return lines
 }
 

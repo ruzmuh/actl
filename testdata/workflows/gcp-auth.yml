@@ -1,0 +1,33 @@
+# Demonstrates ambient GCP identity substitution. In real CI the auth step below
+# federates a GitHub OIDC token into short-lived Google credentials; locally there
+# is no OIDC issuer, so actl intercepts the step and injects your ambient gcloud
+# Application Default Credentials instead (run `gcloud auth application-default
+# login` first). The TUI prints a transparency line: what it would federate as vs
+# the local identity it runs as. Disable with -gcp-identity=false.
+#
+#   gcloud auth application-default login
+#   go run ./cmd/actl -var GCP_PROJECT=your-project testdata/workflows/gcp-auth.yml
+#
+# The workload_identity_provider / service_account below are placeholders — only the
+# presence of google-github-actions/auth matters for the local substitution. The
+# project is the workflow's concern (as on GitHub): the read step passes --project
+# explicitly, fed by a var, so there's nothing project-shaped for actl to guess.
+name: gcp-auth
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/123456789/locations/global/workloadIdentityPools/gh-pool/providers/gh-provider
+          service_account: actl-sample@my-project.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: read-only call as the ambient identity
+        run: gcloud storage buckets list --project "${{ vars.GCP_PROJECT }}"
