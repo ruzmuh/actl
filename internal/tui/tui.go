@@ -107,6 +107,9 @@ func noticeLines(sess *debugger.Session) []string {
 				len(locals), strings.Join(locals, ", ")))
 		}
 	}
+	if cfg := configLine(sess.ConfigSummary()); cfg != "" {
+		lines = append(lines, cfg)
+	}
 	if steps := sess.CheckoutSteps(); len(steps) > 0 {
 		if src := sess.CheckoutSource(); src != "" {
 			lines = append(lines, fmt.Sprintf("checkout intercepted (%s) — copies your working tree %s (.gitignore respected)",
@@ -148,6 +151,25 @@ func needsLines(summaries []debugger.NeedsSummary) []string {
 		lines = append(lines, fmt.Sprintf("needs %q isolated → result=%s · %s", n.Job, result, outs))
 	}
 	return lines
+}
+
+// configLine renders a redacted summary of supplied secrets/vars/env: counts
+// and names, never values. Empty when nothing was supplied.
+func configLine(cfg debugger.ConfigSummary) string {
+	var parts []string
+	if n := len(cfg.Secrets); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d secret(s): %s", n, strings.Join(cfg.Secrets, ", ")))
+	}
+	if n := len(cfg.Vars); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d var(s): %s", n, strings.Join(cfg.Vars, ", ")))
+	}
+	if n := len(cfg.Env); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d env: %s", n, strings.Join(cfg.Env, ", ")))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "loaded " + strings.Join(parts, " · ") + " (names only — values withheld)"
 }
 
 func (m Model) Init() tea.Cmd {

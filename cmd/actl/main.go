@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/joho/godotenv"
 
 	"github.com/ruzmuh/actl/internal/debugger"
 	"github.com/ruzmuh/actl/internal/tui"
@@ -38,9 +39,14 @@ func main() {
 	source := flag.String("source", "", "working tree a default actions/checkout copies into the workspace (no host mutation); default current dir")
 	image := flag.String("image", "catthehacker/ubuntu:act-latest", "docker image mapped to ubuntu-latest (first run pulls it)")
 	breakOnError := flag.Bool("break-on-error", true, "halt after a step that fails")
-	var needs, envs stringSlice
+	secretFile := flag.String("secret-file", ".secrets", "dotenv file of secrets.* (skipped if absent; keep it out of git)")
+	varFile := flag.String("var-file", ".vars", "dotenv file of vars.* (skipped if absent)")
+	envFile := flag.String("env-file", ".env", "dotenv file of env vars (skipped if absent)")
+	var needs, envs, secrets, vars stringSlice
 	flag.Var(&needs, "need", "seed an upstream needs value: 'JOB.outputs.NAME=VALUE' or 'JOB.result=VALUE' (repeatable)")
-	flag.Var(&envs, "env", "set an env var for the run: 'KEY=VALUE' (repeatable)")
+	flag.Var(&envs, "env", "set an env var for the run: 'KEY=VALUE' (repeatable, overrides -env-file)")
+	flag.Var(&secrets, "secret", "set a secret for the run: 'KEY=VALUE' (repeatable, overrides -secret-file)")
+	flag.Var(&vars, "var", "set a var for the run: 'KEY=VALUE' (repeatable, overrides -var-file)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: actl [flags] [workflow.yml]\n\n")
 		flag.PrintDefaults()
@@ -58,6 +64,20 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A missing dotenv file is fine when the path is the default; if the user
+	// pointed a flag at a file, a missing/unreadable file is an error (likely a typo).
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	secretMap, serr := loadConfig(*secretFile, set["secret-file"], secrets)
+	varMap, verr := loadConfig(*varFile, set["var-file"], vars)
+	envMap, eerr := loadConfig(*envFile, set["env-file"], envs)
+	for _, e := range []error{serr, verr, eerr} {
+		if e != nil {
+			fmt.Fprintln(os.Stderr, "actl:", e)
+			os.Exit(2)
+		}
+	}
+
 	opts := debugger.Options{
 		WorkflowPath: path,
 		EventName:    *event,
@@ -68,7 +88,9 @@ func main() {
 		Image:        *image,
 		BreakOnError: *breakOnError,
 		Needs:        needsMap,
-		Env:          parseKeyVals(envs),
+		Secrets:      secretMap,
+		Vars:         varMap,
+		Env:          envMap,
 	}
 
 	if err := run(opts); err != nil {
@@ -104,6 +126,29 @@ func parseNeeds(entries []string) (map[string]debugger.NeedsInput, error) {
 			return nil, fmt.Errorf("bad -need %q: want JOB.outputs.NAME=VALUE or JOB.result=VALUE", e)
 		}
 		out[job] = in
+	}
+	return out, nil
+}
+
+// loadConfig reads a dotenv file into a map, then applies KEY=VALUE flag
+// overrides (which win). A missing file is skipped unless explicit, in which case
+// it (and any parse error) is reported. Returns nil when nothing loaded.
+func loadConfig(file string, explicit bool, overrides []string) (map[string]string, error) {
+	out := map[string]string{}
+	data, err := godotenv.Read(file)
+	switch {
+	case err == nil:
+		for k, v := range data {
+			out[k] = v
+		}
+	case explicit || !errors.Is(err, os.ErrNotExist):
+		return nil, fmt.Errorf("read %s: %w", file, err)
+	}
+	for k, v := range parseKeyVals(overrides) {
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil, nil
 	}
 	return out, nil
 }

@@ -1,0 +1,28 @@
+# Demonstrates loading secrets / vars / env into a run. actl reads act's dotenv
+# triple from the working dir — .secrets → secrets.*, .vars → vars.*, .env → env
+# — and you can override individual keys with -secret/-var/-env KEY=VALUE.
+#
+#   printf 'TOKEN=s3cr3t\n'    > .secrets   # gitignored — never committed
+#   printf 'REGION=eu-west-1\n' > .vars
+#   printf 'STAGE=dev\n'        > .env
+#   go run ./cmd/actl testdata/workflows/config.yml
+#
+#   # or point at files outside the repo and override one key:
+#   go run ./cmd/actl -secret-file ~/.config/actl/demo.secrets \
+#     -var 'REGION=us-east-1' testdata/workflows/config.yml
+#
+# The TUI prints a redacted line naming what loaded (never the values), and act
+# masks secret values in the step logs.
+name: config
+on: push
+
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - name: read a var and an env (both printed)
+        run: echo "region is ${{ vars.REGION }}, stage is $STAGE"
+      - name: read a secret (masked in logs)
+        run: echo "token length is ${#TOKEN}"
+        env:
+          TOKEN: ${{ secrets.TOKEN }}

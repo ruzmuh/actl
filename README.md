@@ -10,8 +10,8 @@ re-run a step — with **faithful `uses:` execution**, because it stands on
 >
 > Working today: single-job debugging through act's real engine — pause before/after
 > every step, env inspector, drop into the live job container, edit a step's command or
-> env and re-run it in place, breakpoints + run-to-cursor, job selection, and isolated-run
-> `needs` seeding with a transparency line.
+> env and re-run it in place, breakpoints + run-to-cursor, job selection, isolated-run
+> `needs` seeding, and secrets / vars / env loading — each with a transparency line.
 
 ## Why
 
@@ -95,6 +95,28 @@ upstream jobs for real to completion first, then pauses only on the target job's
 go run ./cmd/actl -job deploy --with-deps testdata/workflows/pipeline.yml
 ```
 
+### Secrets, vars & env
+
+`actl` reads act's dotenv triple from the working dir — `.secrets` → `secrets.*`,
+`.vars` → `vars.*`, `.env` → env vars — so `${{ secrets.X }}`, `${{ vars.X }}` and `$X`
+resolve as on GitHub. These files are **gitignored**; keep them out of commits. Override
+individual keys with repeatable `-secret`/`-var`/`-env KEY=VALUE` (these win over the
+files), or point at a file outside the repo with `-secret-file`/`-var-file`/`-env-file`.
+
+```sh
+printf 'TOKEN=s3cr3t\n'     > .secrets   # gitignored
+printf 'REGION=eu-west-1\n' > .vars
+printf 'STAGE=dev\n'        > .env
+go run ./cmd/actl testdata/workflows/config.yml
+
+# keep secrets outside the repo and override one key for this run:
+go run ./cmd/actl -secret-file ~/.config/actl/demo.secrets \
+  -var 'REGION=us-east-1' testdata/workflows/config.yml
+```
+
+The TUI prints a **redacted** transparency line naming what loaded — counts and names
+only, never values — and act masks secret values in the step logs.
+
 ### Workspace
 
 By default the job runs with an **empty workspace** (the repo is kept out of the container),
@@ -133,7 +155,7 @@ library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ �
 edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓ →
 run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:` (node / docker / composite) ✓ →
 workspace mount for local actions (`-workdir`) ✓ → faithful `actions/checkout` (copies your
-local working tree) ✓.
+local working tree) ✓ → secrets / vars / env from act's dotenv triple ✓.
 Next: ambient identity substitution → full multi-job graph → upstream the hook(s).
 
 ## License

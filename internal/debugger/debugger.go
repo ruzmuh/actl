@@ -58,6 +58,15 @@ type NeedsSummary struct {
 	Outputs map[string]string
 }
 
+// ConfigSummary is a redacted view of the secrets/vars/env supplied to the run:
+// the names that loaded, never their values, so a transparency line (and any
+// screenshot of it) leaks nothing sensitive.
+type ConfigSummary struct {
+	Secrets []string // secret names (sorted), values withheld
+	Vars    []string // var names (sorted)
+	Env     []string // env names (sorted)
+}
+
 // Options configures a debug Session. Only WorkflowPath is required.
 type Options struct {
 	WorkflowPath string                // path to the workflow file
@@ -67,7 +76,8 @@ type Options struct {
 	Image        string                // docker image mapped to ubuntu-latest (default catthehacker)
 	Workdir      string                // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
 	Source       string                // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
-	Secrets      map[string]string     // secrets exposed to the workflow
+	Secrets      map[string]string     // secrets.* exposed to the workflow
+	Vars         map[string]string     // vars.* exposed to the workflow
 	Env          map[string]string     // extra env for containers
 	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
 	BreakOnError bool                  // in Continue mode, halt after a step that errored
@@ -122,6 +132,7 @@ type Session struct {
 	checkouts      map[int]bool   // step indices of intercepted default checkouts (rewritten to no-ops)
 	checkoutLabels []string       // their labels, for transparency
 	checkoutSource string         // host tree copied into the workspace at checkout (empty unless copy mode)
+	configSummary  ConfigSummary  // redacted names of supplied secrets/vars/env (for transparency)
 	runner         runner.Runner
 	plan           *model.Plan
 	tmpDir         string // non-empty if we created (and must clean up) the workdir
@@ -249,6 +260,7 @@ func New(opts Options) (*Session, error) {
 		checkouts:      checkouts,
 		checkoutLabels: checkoutLabelsOf(run.Job().Steps, checkouts),
 		checkoutSource: checkoutSource,
+		configSummary:  summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
 		plan:           execPlan,
 		tmpDir:         tmpDir,
 		pauses:         make(chan PauseEvent),
@@ -269,7 +281,7 @@ func New(opts Options) (*Session, error) {
 		LogOutput:  true, // route step stdout through the logger (captured below)
 		Env:        orEmpty(opts.Env),
 		Secrets:    orEmpty(opts.Secrets),
-		Vars:       map[string]string{},
+		Vars:       orEmpty(opts.Vars),
 		// A user-supplied workdir is bind-mounted: act's copy mode leaves the
 		// workspace volume empty (it never populates it), so local `uses: ./…`
 		// actions only resolve when the dir is mounted. The empty-workdir default
@@ -322,6 +334,10 @@ func (s *Session) CheckoutSteps() []string { return s.checkoutLabels }
 // time; empty when there's nothing to copy (e.g. a -workdir mount already holds
 // the code, or there were no intercepted checkouts).
 func (s *Session) CheckoutSource() string { return s.checkoutSource }
+
+// ConfigSummary returns the redacted names of the secrets/vars/env supplied to
+// the run (values withheld), for a transparency line.
+func (s *Session) ConfigSummary() ConfigSummary { return s.configSummary }
 
 // LocalUsesSteps returns the labels of steps that reference a local action
 // (`uses: ./…`) — these need a real workspace (run with a workdir set).
@@ -703,6 +719,28 @@ func toWhen(w runner.BarrierWhen) When {
 		return After
 	}
 	return Before
+}
+
+// summarizeConfig collects the sorted key names of the supplied secrets/vars/env
+// for a redacted transparency line — names only, values never retained here.
+func summarizeConfig(secrets, vars, env map[string]string) ConfigSummary {
+	return ConfigSummary{
+		Secrets: sortedKeys(secrets),
+		Vars:    sortedKeys(vars),
+		Env:     sortedKeys(env),
+	}
+}
+
+func sortedKeys(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func orEmpty(m map[string]string) map[string]string {

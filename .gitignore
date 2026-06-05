@@ -9,10 +9,14 @@
 /go.work
 /go.work.sum
 
-# secrets loaded by actl
+# secrets / vars / env loaded by actl (act's dotenv triple) — never commit these
 .env
 .env.*
 !.env.example
+.secrets
+.secrets.*
+.vars
+.vars.*
 
 # editor / OS
 .DS_Store

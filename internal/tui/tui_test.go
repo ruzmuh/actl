@@ -108,3 +108,20 @@ func TestModelFlow(t *testing.T) {
 		t.Errorf("done view missing 'run complete':\n%s", got)
 	}
 }
+
+// TestConfigLine locks the redacted config banner: counts and names appear,
+// values never do.
+func TestConfigLine(t *testing.T) {
+	got := configLine(debugger.ConfigSummary{
+		Secrets: []string{"TOKEN"},
+		Vars:    []string{"REGION", "STAGE"},
+	})
+	for _, want := range []string{"1 secret(s): TOKEN", "2 var(s): REGION, STAGE", "values withheld"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("configLine missing %q:\n%s", want, got)
+		}
+	}
+	if configLine(debugger.ConfigSummary{}) != "" {
+		t.Error("empty summary should render no line")
+	}
+}

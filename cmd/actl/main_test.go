@@ -1,6 +1,46 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestLoadConfig(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, ".secrets")
+	if err := os.WriteFile(file, []byte("TOKEN=fromfile\nKEEP=yes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// File loads; a KEY=VALUE override wins over the file's value.
+	got, err := loadConfig(file, true, []string{"TOKEN=override"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if got["TOKEN"] != "override" {
+		t.Errorf("TOKEN = %q, want override (flag beats file)", got["TOKEN"])
+	}
+	if got["KEEP"] != "yes" {
+		t.Errorf("KEEP = %q, want yes (from file)", got["KEEP"])
+	}
+}
+
+func TestLoadConfigMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope")
+	// Default path (not explicit): absent file is fine, overrides still apply.
+	got, err := loadConfig(missing, false, []string{"A=1"})
+	if err != nil || got["A"] != "1" {
+		t.Errorf("default missing: got %v, err %v", got, err)
+	}
+	// Nothing at all → nil map, no error.
+	if got, err := loadConfig(missing, false, nil); err != nil || got != nil {
+		t.Errorf("empty: got %v, err %v; want nil,nil", got, err)
+	}
+	// Explicitly pointed at a missing file → error (likely a typo).
+	if _, err := loadConfig(missing, true, nil); err == nil {
+		t.Error("explicit missing: want error, got nil")
+	}
+}
 
 func TestParseNeeds(t *testing.T) {
 	in := []string{
