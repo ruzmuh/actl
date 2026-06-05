@@ -34,6 +34,23 @@ func TestNew(t *testing.T) {
 	}
 }
 
+// TestUsesSampleParses confirms a uses-heavy workflow parses and plans through
+// act's model with no special-casing on our side (run + node + docker steps).
+func TestUsesSampleParses(t *testing.T) {
+	s, err := New(Options{WorkflowPath: "../../testdata/workflows/uses.yml", Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(s.Steps()); n != 4 {
+		t.Fatalf("len(Steps) = %d, want 4", n)
+	}
+	// the node action step carries a Uses and no Run
+	node := s.Steps()[1]
+	if node.Uses == "" || node.Run != "" {
+		t.Errorf("step 2 should be a uses: step, got Uses=%q Run=%q", node.Uses, node.Run)
+	}
+}
+
 func TestInspectionNilWhileRunning(t *testing.T) {
 	s, err := New(Options{WorkflowPath: sampleWorkflow, Workdir: t.TempDir()})
 	if err != nil {

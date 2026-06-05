@@ -1,0 +1,36 @@
+# Exercises `uses:` execution through act's engine — the whole reason actl stands
+# on act instead of reimplementing the runner. Pause before/after each step the
+# same way as for `run:` steps; editing a step's command (`i`) is disabled for
+# `uses:` steps (they have no inline script), but step / re-run / shell / env all
+# work.
+#
+#   go run ./cmd/actl testdata/workflows/uses.yml
+#
+# Note: actl runs with an empty workspace (the repo is deliberately kept out of
+# the container), so REMOTE actions work (they're fetched into act's cache), but
+# LOCAL actions (`uses: ./...`) and `actions/checkout` of the working repo won't
+# find any files. Use published actions here.
+name: uses
+on: push
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: plain run (baseline)
+        run: echo "a normal run step, for comparison"
+
+      - name: node action (remote JS)
+        id: hello
+        uses: actions/hello-world-javascript-action@main
+        with:
+          who-to-greet: actl
+
+      - name: read the node action's output
+        run: echo "the JS action set time = '${{ steps.hello.outputs.time }}'"
+
+      - name: docker action (image URL)
+        uses: docker://alpine:3.20
+        with:
+          entrypoint: /bin/echo
+          args: hello from inside an alpine container

@@ -231,7 +231,11 @@ func New(opts Options) (*Session, error) {
 		Env:         orEmpty(opts.Env),
 		Secrets:     orEmpty(opts.Secrets),
 		Vars:        map[string]string{},
-		StepBarrier: s.barrier,
+		// act's CLI defaults this; we build Config ourselves, and an empty value
+		// makes the github server URL "https://" (no host), so remote `uses:`
+		// actions fail to clone. Set the public default explicitly.
+		GitHubInstance: "github.com",
+		StepBarrier:    s.barrier,
 	}
 	r, err := runner.New(cfg)
 	if err != nil {
