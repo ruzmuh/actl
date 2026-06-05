@@ -179,6 +179,46 @@ func TestConfigLine(t *testing.T) {
 	}
 }
 
+// TestRuntimeBannerRender renders the real banner end-to-end (New → noticeLines →
+// View) for a workflow_dispatch run with all four §4 runtime-context surfaces
+// populated, and confirms each transparency line reaches the rendered View. It also
+// logs the banner so a -v run shows what the TUI prints (no Docker/TTY needed — the
+// notices render before the container ever starts).
+func TestRuntimeBannerRender(t *testing.T) {
+	sess, err := debugger.New(debugger.Options{
+		WorkflowPath: "../../testdata/workflows/inputs.yml",
+		EventName:    "workflow_dispatch",
+		Workdir:      t.TempDir(),
+		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_demo"},
+		Inputs:       map[string]string{"environment": "production"},
+		Repository:   "ruzmuh/actl",
+		Ref:          "refs/heads/feature",
+		Sha:          "deadbeefcafebabe",
+		Actor:        "ruzmuh",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var m tea.Model = New(sess, func() {})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	got := m.View()
+	t.Logf("\n%s", got)
+
+	for _, want := range []string{
+		"github.token set (from secret)",
+		"provided environment=production",
+		"github context: repository=ruzmuh/actl",
+		"ref=refs/heads/feature",
+		"sha=deadbee",
+		"actor=ruzmuh (override)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered banner missing %q", want)
+		}
+	}
+}
+
 // TestRuntimeContextLines locks the §4 transparency banner for the GitHub runtime
 // context a clean local runner lacks: token, inputs, event, and github.* context.
 func TestRuntimeContextLines(t *testing.T) {

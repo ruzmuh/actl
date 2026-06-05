@@ -24,17 +24,56 @@ import (
 	"github.com/ruzmuh/actl/internal/debugger"
 )
 
+// stringSlice collects a repeatable flag (e.g. -input a=1 -input b=2).
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func main() {
 	workflowPath := flag.String("workflow", "testdata/workflows/sample.yml", "path to the workflow file")
 	event := flag.String("event", "push", "event name to plan for")
 	image := flag.String("image", "catthehacker/ubuntu:act-latest", "docker image for ubuntu-latest (first run pulls it)")
 	breaks := flag.String("break", "", "comma-separated zero-based step indices to break before (Continue mode)")
+	githubToken := flag.String("github-token", "", "value for github.token / secrets.GITHUB_TOKEN")
+	var inputs stringSlice
+	flag.Var(&inputs, "input", "workflow_dispatch/workflow_call input NAME=VALUE (repeatable)")
 	flag.Parse()
 
-	if err := run(*workflowPath, *event, *image, parseBreaks(*breaks)); err != nil {
+	if err := run(runConfig{
+		workflowPath: *workflowPath,
+		event:        *event,
+		image:        *image,
+		breaks:       parseBreaks(*breaks),
+		token:        *githubToken,
+		inputs:       parseKeyVals(inputs),
+	}); err != nil {
 		fmt.Fprintln(os.Stderr, "spike-barrier:", err)
 		os.Exit(1)
 	}
+}
+
+// parseKeyVals turns NAME=VALUE entries into a map (nil when empty).
+func parseKeyVals(entries []string) map[string]string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for _, e := range entries {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+type runConfig struct {
+	workflowPath, event, image, token string
+	breaks                            []int
+	inputs                            map[string]string
 }
 
 func parseBreaks(s string) []int {
@@ -47,19 +86,21 @@ func parseBreaks(s string) []int {
 	return out
 }
 
-func run(workflowPath, event, image string, breaks []int) error {
+func run(cfg runConfig) error {
 	sess, err := debugger.New(debugger.Options{
-		WorkflowPath: workflowPath,
-		EventName:    event,
-		Image:        image,
+		WorkflowPath: cfg.workflowPath,
+		EventName:    cfg.event,
+		Image:        cfg.image,
 		BreakOnError: true,
-		Breakpoints:  breaks,
+		Breakpoints:  cfg.breaks,
+		GitHubToken:  cfg.token,
+		Inputs:       cfg.inputs,
 	})
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("debugging job %q (%s, event %q)\n", sess.JobID(), workflowPath, event)
+	fmt.Printf("debugging job %q (%s, event %q)\n", sess.JobID(), cfg.workflowPath, cfg.event)
 	for i, st := range sess.Steps() {
 		fmt.Printf("  %d. %s\n", i+1, st.String())
 	}
