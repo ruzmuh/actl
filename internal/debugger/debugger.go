@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -64,7 +65,7 @@ type Options struct {
 	JobID        string                // which job to debug; required only if the event plans more than one
 	WithDeps     bool                  // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
 	Image        string                // docker image mapped to ubuntu-latest (default catthehacker)
-	Workdir      string                // job workdir; a temp dir is created and cleaned up if empty
+	Workdir      string                // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
 	Secrets      map[string]string     // secrets exposed to the workflow
 	Env          map[string]string     // extra env for containers
 	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
@@ -111,13 +112,15 @@ type control struct {
 
 // Session is one debug run of a single job. Construct with New, then Start.
 type Session struct {
-	jobID    string
-	steps    []*model.Step
-	needs    []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
-	withDeps bool           // upstream needs run for real before the target job
-	runner   runner.Runner
-	plan     *model.Plan
-	tmpDir   string // non-empty if we created (and must clean up) the workdir
+	jobID      string
+	steps      []*model.Step
+	needs      []NeedsSummary // how the selected job's needs were satisfied locally (for transparency)
+	withDeps   bool           // upstream needs run for real before the target job
+	isolatedWS bool           // workspace is an empty temp dir (no user repo) → local actions won't resolve
+	workspace  string         // the bind-mounted workspace path when not isolated (empty otherwise)
+	runner     runner.Runner
+	plan       *model.Plan
+	tmpDir     string // non-empty if we created (and must clean up) the workdir
 
 	pauses  chan PauseEvent
 	resume  chan control
@@ -197,6 +200,10 @@ func New(opts Options) (*Session, error) {
 			return nil, fmt.Errorf("debugger: temp workdir: %w", err)
 		}
 		tmpDir = workdir
+	} else if workdir, err = filepath.Abs(workdir); err != nil {
+		// act maps the container action path from Config.Workdir, so a relative
+		// path mis-resolves local `uses: ./…` actions (act's CLI abs's it too).
+		return nil, fmt.Errorf("debugger: workdir: %w", err)
 	}
 
 	breakpoints := make(map[int]bool, len(opts.Breakpoints))
@@ -209,6 +216,8 @@ func New(opts Options) (*Session, error) {
 		steps:       run.Job().Steps,
 		needs:       needs,
 		withDeps:    opts.WithDeps,
+		isolatedWS:  tmpDir != "", // we created an empty temp workspace (no user repo)
+		workspace:   mountedWorkspace(tmpDir, workdir),
 		plan:        execPlan,
 		tmpDir:      tmpDir,
 		pauses:      make(chan PauseEvent),
@@ -222,15 +231,20 @@ func New(opts Options) (*Session, error) {
 	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done, drop: isGitContextNoise}}
 
 	cfg := &runner.Config{
-		Workdir:     workdir,
-		BindWorkdir: false,
-		EventName:   opts.EventName,
-		Platforms:   map[string]string{"ubuntu-latest": opts.Image},
-		AutoRemove:  true,
-		LogOutput:   true, // route step stdout through the logger (captured below)
-		Env:         orEmpty(opts.Env),
-		Secrets:     orEmpty(opts.Secrets),
-		Vars:        map[string]string{},
+		Workdir:    workdir,
+		EventName:  opts.EventName,
+		Platforms:  map[string]string{"ubuntu-latest": opts.Image},
+		AutoRemove: true,
+		LogOutput:  true, // route step stdout through the logger (captured below)
+		Env:        orEmpty(opts.Env),
+		Secrets:    orEmpty(opts.Secrets),
+		Vars:       map[string]string{},
+		// A user-supplied workdir is bind-mounted: act's copy mode leaves the
+		// workspace volume empty (it never populates it), so local `uses: ./…`
+		// actions only resolve when the dir is mounted. The empty-workdir default
+		// uses an isolated temp dir and never mounts the user's tree.
+		BindWorkdir:  opts.Workdir != "",
+		UseGitIgnore: true, // act default: don't copy .gitignored paths into the container
 		// act's CLI defaults this; we build Config ourselves, and an empty value
 		// makes the github server URL "https://" (no host), so remote `uses:`
 		// actions fail to clone. Set the public default explicitly.
@@ -260,6 +274,26 @@ func (s *Session) NeedsSummary() []NeedsSummary { return s.needs }
 
 // WithDeps reports whether the job's upstream needs run for real before it.
 func (s *Session) WithDeps() bool { return s.withDeps }
+
+// WorkspaceIsolated reports whether the run uses an empty temp workspace (no user
+// repo), in which case local `uses: ./…` actions and checkout can't resolve.
+func (s *Session) WorkspaceIsolated() bool { return s.isolatedWS }
+
+// Workspace returns the bind-mounted workspace path, or empty when isolated. When
+// non-empty, steps run in the container can write to this path on the host.
+func (s *Session) Workspace() string { return s.workspace }
+
+// LocalUsesSteps returns the labels of steps that reference a local action
+// (`uses: ./…`) — these need a real workspace (run with a workdir set).
+func (s *Session) LocalUsesSteps() []string {
+	var out []string
+	for _, st := range s.steps {
+		if strings.HasPrefix(st.Uses, "./") {
+			out = append(out, st.String())
+		}
+	}
+	return out
+}
 
 // Start launches the run in the background. The run halts at the first barrier
 // (before the first step) per the default Step mode; drive it via the control
@@ -468,6 +502,15 @@ func (s *Session) shouldHalt(info runner.StepBarrierInfo) bool {
 		return true
 	}
 	return false
+}
+
+// mountedWorkspace is the bind-mounted workspace path for transparency, or empty
+// when the workspace is an isolated temp dir (tmpDir set).
+func mountedWorkspace(tmpDir, workdir string) string {
+	if tmpDir != "" {
+		return ""
+	}
+	return workdir
 }
 
 func (s *Session) cleanup() {

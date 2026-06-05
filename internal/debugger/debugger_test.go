@@ -51,6 +51,61 @@ func TestUsesSampleParses(t *testing.T) {
 	}
 }
 
+// TestWorkspaceIsolation covers the workspace caveat surfaced to the user: with
+// an empty workspace local `uses: ./` actions can't resolve, and we flag them.
+func TestWorkspaceIsolation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "local.yml")
+	const wf = `name: local
+on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup
+        uses: ./.github/actions/setup
+      - name: run
+        run: echo hi
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// empty workdir -> isolated temp workspace; the local action is flagged
+	s, err := New(Options{WorkflowPath: path}) // no Workdir
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.cleanup() // we never Start, so reclaim the temp workspace ourselves
+	if !s.WorkspaceIsolated() {
+		t.Error("WorkspaceIsolated() = false, want true for an empty workdir")
+	}
+	if locals := s.LocalUsesSteps(); len(locals) != 1 || locals[0] != "setup" {
+		t.Errorf("LocalUsesSteps() = %v, want [setup]", locals)
+	}
+
+	// a real workdir -> not isolated
+	s2, err := New(Options{WorkflowPath: path, Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.WorkspaceIsolated() {
+		t.Error("WorkspaceIsolated() = true, want false when a workdir is given")
+	}
+}
+
+// TestLocalActionFixture guards the committed workspace fixture: it parses and
+// its local composite step is detected (the live `-workdir` test runs it).
+func TestLocalActionFixture(t *testing.T) {
+	s, err := New(Options{WorkflowPath: "../../testdata/workspace/.github/workflows/local.yml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.cleanup()
+	if locals := s.LocalUsesSteps(); len(locals) != 1 {
+		t.Errorf("LocalUsesSteps() = %v, want one local action step", locals)
+	}
+}
+
 func TestInspectionNilWhileRunning(t *testing.T) {
 	s, err := New(Options{WorkflowPath: sampleWorkflow, Workdir: t.TempDir()})
 	if err != nil {

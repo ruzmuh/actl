@@ -1,0 +1,13 @@
+# A tiny LOCAL composite action. It only resolves when the workspace containing
+# it is in the container — i.e. when actl is run with `-workdir testdata/workspace`.
+name: greet
+description: a local composite action used to test workspace selection
+inputs:
+  who:
+    description: who to greet
+    default: world
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "hello ${{ inputs.who }} from a LOCAL composite action"

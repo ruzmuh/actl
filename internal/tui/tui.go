@@ -54,9 +54,9 @@ type Model struct {
 	sess   *debugger.Session
 	cancel context.CancelFunc
 
-	title  string
-	labels []string // step labels, in order
-	needs  []string // transparency lines for the job's needs (isolated-run notices)
+	title   string
+	labels  []string // step labels, in order
+	notices []string // transparency banner: isolated-run needs + workspace caveats
 
 	state  runState
 	cur    int // index of the step at the current/last pause (-1 before first)
@@ -85,12 +85,28 @@ func New(sess *debugger.Session, cancel context.CancelFunc) Model {
 		cancel:      cancel,
 		title:       fmt.Sprintf("job %q", sess.JobID()),
 		labels:      labels,
-		needs:       needsLines(sess.NeedsSummary()),
+		notices:     noticeLines(sess),
 		state:       stateRunning,
 		cur:         -1,
 		breakpoints: make(map[int]bool),
 		tempBreak:   -1,
 	}
+}
+
+// noticeLines builds the transparency banner: how the job's needs are satisfied
+// (seeded or live), plus a workspace caveat when running with an empty workspace
+// and the job has local actions that therefore won't resolve.
+func noticeLines(sess *debugger.Session) []string {
+	lines := needsLines(sess.NeedsSummary())
+	if sess.WorkspaceIsolated() {
+		if locals := sess.LocalUsesSteps(); len(locals) > 0 {
+			lines = append(lines, fmt.Sprintf("empty workspace — %d local action(s) won't resolve; mount your repo with -workdir . : %s",
+				len(locals), strings.Join(locals, ", ")))
+		}
+	} else {
+		lines = append(lines, fmt.Sprintf("workspace %s is mounted — steps run in the container can write to it", sess.Workspace()))
+	}
+	return lines
 }
 
 // needsLines renders one transparency line per need: which upstream job is being
@@ -310,7 +326,7 @@ var (
 func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("actl · "+m.title) + "\n")
-	for _, line := range m.needs {
+	for _, line := range m.notices {
 		b.WriteString(dimStyle.Render("⚠ "+line) + "\n")
 	}
 	b.WriteString("\n")

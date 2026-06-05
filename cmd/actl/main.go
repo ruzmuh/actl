@@ -34,6 +34,7 @@ func main() {
 	event := flag.String("event", "push", "event name to plan for")
 	job := flag.String("job", "", "job to debug (required only if the event plans more than one)")
 	withDeps := flag.Bool("with-deps", false, "run the job's upstream needs for real (to completion) before debugging it, instead of isolating it")
+	workdir := flag.String("workdir", "", "bind-mount this dir as the workspace so local 'uses: ./' actions resolve (e.g. '.'); empty = isolated empty workspace. NOTE: a mounted workspace is writable — steps can change your tree")
 	image := flag.String("image", "catthehacker/ubuntu:act-latest", "docker image mapped to ubuntu-latest (first run pulls it)")
 	breakOnError := flag.Bool("break-on-error", true, "halt after a step that fails")
 	var needs, envs stringSlice
@@ -61,6 +62,7 @@ func main() {
 		EventName:    *event,
 		JobID:        *job,
 		WithDeps:     *withDeps,
+		Workdir:      *workdir,
 		Image:        *image,
 		BreakOnError: *breakOnError,
 		Needs:        needsMap,

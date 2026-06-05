@@ -95,6 +95,22 @@ upstream jobs for real to completion first, then pauses only on the target job's
 go run ./cmd/actl -job deploy --with-deps testdata/workflows/pipeline.yml
 ```
 
+### Workspace
+
+By default the job runs with an **empty workspace** (the repo is kept out of the container),
+so remote `uses:` actions work but local `uses: ./…` actions and `actions/checkout` of the
+working repo won't find any files — the TUI flags this when it spots local actions. That's the
+common case; reach for `-workdir` only when you actually have local actions to debug.
+
+`-workdir DIR` **bind-mounts** `DIR` as the workspace so local actions resolve. Note the
+tradeoff: a mounted workspace is **writable**, so steps running in the container can change
+your working tree (build artifacts, generated files). The TUI shows a transparency line when
+a workspace is mounted.
+
+```sh
+go run ./cmd/actl -workdir . path/to/workflow.yml
+```
+
 `go test ./...` runs the tests (no Docker needed).
 
 ## Roadmap
@@ -102,9 +118,10 @@ go run ./cmd/actl -job deploy --with-deps testdata/workflows/pipeline.yml
 See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md). Done so far:
 library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI (step/inspect/shell/
 edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓ →
-run-dependencies-then-debug (`--with-deps`) ✓.
-Next: full multi-job graph (step through every job) → ambient identity substitution →
-`uses:` verification → upstream the hook.
+run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:` (node / docker / composite) ✓ →
+workspace mount for local actions (`-workdir`) ✓.
+Next: faithful `actions/checkout` (use the local working tree) → ambient identity
+substitution → full multi-job graph → upstream the hook.
 
 ## License
 

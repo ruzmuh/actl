@@ -1,0 +1,23 @@
+# Exercises workspace selection (-workdir) and a LOCAL composite action.
+#
+#   # empty workspace: the local action can't resolve — the TUI flags it, and
+#   # the step would fail:
+#   go run ./cmd/actl testdata/workspace/.github/workflows/local.yml
+#
+#   # -workdir bind-mounts the dir holding .github/actions/greet, so the local
+#   # action resolves (the mounted workspace is writable — steps can change it):
+#   go run ./cmd/actl -workdir testdata/workspace \
+#                     testdata/workspace/.github/workflows/local.yml
+name: local
+on: push
+
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: use the local composite action
+        uses: ./.github/actions/greet
+        with:
+          who: actl
+      - name: plain run
+        run: echo "and a normal run step afterwards"
