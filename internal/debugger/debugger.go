@@ -203,12 +203,10 @@ type Session struct {
 	withDeps       bool                 // upstream needs run for real before the target job
 	isolatedWS     bool                 // workspace is an empty temp dir (no user repo) → local actions won't resolve
 	workspace      string               // the bind-mounted workspace path (empty unless -workdir given)
-	checkouts      map[int]bool         // step indices of intercepted default checkouts (rewritten to no-ops)
-	checkoutLabels []string             // their labels, for transparency
+	interceptors   []stepInterceptor    // neutralize-and-substitute hooks (checkout, cloud-auth), driven by the barrier
+	checkoutLabels []string             // intercepted default-checkout labels, for transparency
 	checkoutSource string               // host tree copied into the workspace at checkout (empty unless copy mode)
 	configSummary  ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
-	gcpSteps       map[int]bool         // step indices of intercepted google-github-actions/auth steps
-	gcpEnv         map[string]string    // GCP credential env injected at the auth step's position (nil if no identity)
 	gcpSummary     GCPSummary           // redacted view of the GCP identity substitution (for transparency)
 	tokenSummary   TokenSummary         // how github.token was satisfied (for transparency)
 	inputsSummary  InputsSummary        // declared/supplied workflow inputs (for transparency)
@@ -287,23 +285,29 @@ func New(opts Options) (*Session, error) {
 		needs = seedNeeds(run, opts.Needs)
 	}
 
-	// Faithful local checkout: a default `actions/checkout` (no ref/repository/
-	// path) would clone a remote over the workspace, losing your local changes.
-	// Rewrite it to a no-op and, when we have a source tree, populate the
-	// workspace from it at the checkout step's position (see barrier) — so steps
-	// before checkout still see an empty workspace, exactly as on GitHub.
-	// Checkouts with inputs are left as a real clone.
-	checkouts := interceptCheckouts(run.Job().Steps)
+	steps := run.Job().Steps
+
+	// Step interceptors neutralize step classes that can't run faithfully on a
+	// local runner — rewriting them to no-ops and substituting the real local effect
+	// at the step's position (see barrier). Each is built once here; the barrier and
+	// the container wiring then iterate s.interceptors uniformly, so adding AWS/Azure
+	// is one more builder + append.
+	//
+	// Faithful local checkout: a default `actions/checkout` (no ref/repository/path)
+	// would clone a remote over the workspace, losing your local changes. Rewrite it
+	// to a no-op now; when we have a source tree the barrier populates the workspace
+	// from it at the checkout step's position — so steps before checkout still see an
+	// empty workspace, exactly as on GitHub. Checkouts with inputs stay a real clone.
+	// The scan must precede the workspace-mode decision below (it branches on whether
+	// there's a checkout to satisfy).
+	checkouts := interceptSteps(steps, isDefaultCheckout, checkoutNoopMsg, nil)
 
 	// Ambient GCP identity substitution (CLAUDE.md §4): a federated
 	// google-github-actions/auth can't mint a GitHub OIDC token locally, so it would
-	// fail and kill the job. Rewrite it to a no-op and inject the dev's ambient
-	// credentials at its position (see barrier). Same intercept-and-substitute shape
-	// as checkout. Intercept whenever the step is present, even without credentials,
-	// so the job still runs (non-cloud steps stay debuggable).
-	gcpSteps, gcpTargets := interceptGCPAuth(run.Job().Steps)
-	gcpEnv, gcpSummary := buildGCP(opts.GCP, gcpSteps, gcpTargets)
-	gcpSummary.Steps = stepLabelsOf(run.Job().Steps, gcpSteps)
+	// fail and kill the job. The interceptor rewrites it to a no-op and (given ambient
+	// creds) injects them at its position. Built even without credentials so the auth
+	// step is still neutralized and non-cloud steps stay debuggable.
+	gcpItc, gcpSummary := buildGCPInterceptor(opts.GCP, steps)
 
 	// Runtime context GitHub injects that a clean local runner lacks (CLAUDE.md §4):
 	// GITHUB_TOKEN, workflow inputs, the event payload, and the github.* context.
@@ -349,6 +353,27 @@ func New(opts Options) (*Session, error) {
 		tmpDir = workdir
 	}
 
+	// Assemble the interceptor list now the workspace mode is known: a copy-mode
+	// checkout populates the workspace at its position (CopyWorkdir), while a bind/
+	// temp workspace already holds the code so the rewritten checkout is a pure no-op
+	// (inject nil). Only attach interceptors that actually own a step.
+	var interceptors []stepInterceptor
+	if len(checkouts) > 0 {
+		var inject func(context.Context, runner.StepBarrierInfo) error
+		if checkoutSource != "" {
+			inject = func(ctx context.Context, info runner.StepBarrierInfo) error {
+				if info.CopyWorkdir == nil {
+					return nil
+				}
+				return info.CopyWorkdir(ctx)
+			}
+		}
+		interceptors = append(interceptors, stepInterceptor{name: "checkout", steps: checkouts, inject: inject})
+	}
+	if len(gcpItc.steps) > 0 {
+		interceptors = append(interceptors, gcpItc)
+	}
+
 	breakpoints := make(map[int]bool, len(opts.Breakpoints))
 	for _, i := range opts.Breakpoints {
 		breakpoints[i] = true
@@ -356,17 +381,15 @@ func New(opts Options) (*Session, error) {
 
 	s := &Session{
 		jobID:          run.JobID,
-		steps:          run.Job().Steps,
+		steps:          steps,
 		needs:          needs,
 		withDeps:       opts.WithDeps,
 		isolatedWS:     tmpDir != "", // we created an empty temp workspace (no user repo)
 		workspace:      bindWS,
-		checkouts:      checkouts,
-		checkoutLabels: stepLabelsOf(run.Job().Steps, checkouts),
+		interceptors:   interceptors,
+		checkoutLabels: stepLabelsOf(steps, checkouts),
 		checkoutSource: checkoutSource,
 		configSummary:  summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
-		gcpSteps:       gcpSteps,
-		gcpEnv:         gcpEnv,
 		gcpSummary:     gcpSummary,
 		tokenSummary:   tokenSummary,
 		inputsSummary:  inputsSummary,
@@ -410,14 +433,17 @@ func New(opts Options) (*Session, error) {
 		GitHubInstance: "github.com",
 		StepBarrier:    s.barrier,
 	}
-	// Make the ambient ADC file visible inside the job container. act parses
-	// ContainerOptions as docker flags, so a read-only volume bind reaches the job
-	// container without a fork patch. Only when there's an auth step to satisfy.
-	if bind := gcpBind(opts.GCP, len(gcpSteps) > 0); bind != "" {
+	// Some interceptors need docker flags on the job container (e.g. GCP mounts the
+	// ambient ADC file read-only). act parses ContainerOptions as docker flags, so
+	// these reach the container without a fork patch.
+	for _, itc := range interceptors {
+		if itc.container == "" {
+			continue
+		}
 		if cfg.ContainerOptions == "" {
-			cfg.ContainerOptions = bind
+			cfg.ContainerOptions = itc.container
 		} else {
-			cfg.ContainerOptions += " " + bind
+			cfg.ContainerOptions += " " + itc.container
 		}
 	}
 	r, err := runner.New(cfg)
@@ -562,24 +588,20 @@ func (s *Session) send(c control) {
 // goroutine. If policy says pass, it returns immediately; if policy says halt, it
 // emits a PauseEvent and blocks until a control arrives.
 func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) error {
-	// Faithful checkout: copy the source tree into the workspace at the (now
-	// no-op) checkout step's position, before any pause. Earlier steps already
-	// ran on an empty workspace; later steps see the code. Only for the debugged
-	// job (the JobID gate keeps --with-deps upstream jobs out).
-	if s.checkoutSource != "" && info.When == runner.BarrierBefore && info.JobID == s.jobID &&
-		s.checkouts[info.Index] && info.CopyWorkdir != nil {
-		if err := info.CopyWorkdir(ctx); err != nil {
-			s.logf("actl: checkout copy failed: %v", err)
-		}
-	}
-
-	// Faithful identity: inject the ambient GCP credentials into the live env at the
-	// (now no-op) auth step's position — earlier steps don't see them, later steps
-	// do, exactly as the real auth step would set them. info.Env is the same live
-	// rc.Env map SetEnv mutates, so the change propagates to subsequent execs.
-	if len(s.gcpEnv) > 0 && info.When == runner.BarrierBefore && info.JobID == s.jobID && s.gcpSteps[info.Index] {
-		for k, v := range s.gcpEnv {
-			info.Env[k] = v
+	// At each step's "before" boundary, run any interceptor that owns this step (in
+	// the debugged job): a default checkout copies the working tree here, a cloud-auth
+	// injects ambient credentials into the live env here — earlier steps don't see the
+	// effect, later steps do, exactly as the real step would apply it. info.Env is the
+	// same live rc.Env map SetEnv mutates, so an env change propagates to later execs.
+	// The JobID gate keeps --with-deps upstream jobs out; adding AWS/Azure is another
+	// entry in s.interceptors, this loop is unchanged.
+	if info.When == runner.BarrierBefore && info.JobID == s.jobID {
+		for _, itc := range s.interceptors {
+			if itc.inject != nil && itc.steps[info.Index] {
+				if err := itc.inject(ctx, info); err != nil {
+					s.logf("actl: %s substitution failed: %v", itc.name, err)
+				}
+			}
 		}
 	}
 
@@ -742,22 +764,45 @@ func isDefaultCheckout(st *model.Step) bool {
 	return true
 }
 
-// interceptCheckouts rewrites each default checkout step to a no-op run (so act
-// doesn't clone a remote over the workspace), preserving its label, and returns
-// their indices. The workspace is populated from the source tree at the step's
-// position by the barrier (see CopyWorkdir).
-func interceptCheckouts(steps []*model.Step) map[int]bool {
+// stepInterceptor neutralizes a class of steps that can't run faithfully on a local
+// runner (a default actions/checkout, a federated cloud-auth) and substitutes the
+// real local effect at the step's position. Built once in New; the barrier and the
+// container wiring then iterate []stepInterceptor uniformly, so AWS/Azure are one
+// more builder + append — no new barrier code and no new Session fields.
+type stepInterceptor struct {
+	name      string                                                       // "checkout", "gcp-auth" — names the non-fatal failure log
+	steps     map[int]bool                                                 // indices it rewrote to no-ops, within the debugged job
+	inject    func(ctx context.Context, info runner.StepBarrierInfo) error // run at BarrierBefore on an owned index for the target job; nil = nothing to substitute
+	container string                                                       // docker flags appended to Config.ContainerOptions; "" = none
+}
+
+// No-op scripts the rewritten steps run in place of their real action (so the step
+// still shows in logs that actl handled it).
+const (
+	checkoutNoopMsg = `echo "actl: checkout intercepted — using your local working tree"`
+	gcpAuthNoopMsg  = `echo "actl: GCP auth intercepted — using ambient identity"`
+)
+
+// interceptSteps rewrites every step matching `match` to a no-op echoing `msg`,
+// preserving its label (so the rewritten step still shows its origin), and returns
+// the rewritten indices. `capture`, if non-nil, runs on each matched step BEFORE its
+// Uses/With are cleared (e.g. to read a cloud-auth step's federation target). This is
+// the shared mechanic every interceptor's scan/rewrite is built from.
+func interceptSteps(steps []*model.Step, match func(*model.Step) bool, msg string, capture func(*model.Step)) map[int]bool {
 	out := map[int]bool{}
 	for i, st := range steps {
-		if !isDefaultCheckout(st) {
+		if !match(st) {
 			continue
+		}
+		if capture != nil {
+			capture(st)
 		}
 		if st.Name == "" {
 			st.Name = st.Uses // keep the original label visible after we clear Uses
 		}
 		st.Uses = ""
 		st.With = nil
-		st.Run = `echo "actl: checkout intercepted — using your local working tree"`
+		st.Run = msg
 		out[i] = true
 	}
 	return out
@@ -768,28 +813,33 @@ func isGCPAuth(st *model.Step) bool {
 	return st.Uses == "google-github-actions/auth" || strings.HasPrefix(st.Uses, "google-github-actions/auth@")
 }
 
-// interceptGCPAuth rewrites each google-github-actions/auth step to a no-op run (so
-// it doesn't try to federate against a GitHub OIDC issuer that doesn't exist
-// locally), preserving its label, and returns their indices plus the federation
-// target each one declared ("<service_account> via <provider>") for transparency.
-// The ambient credentials are injected at the step's position by the barrier.
-func interceptGCPAuth(steps []*model.Step) (map[int]bool, []string) {
-	out := map[int]bool{}
+// buildGCPInterceptor scans and rewrites each google-github-actions/auth step to a
+// no-op (so it doesn't try to federate against a GitHub OIDC issuer that doesn't
+// exist locally), then assembles the substitution: the ambient credential env to
+// inject at the step's position and the read-only ADC volume mount. Returns the
+// interceptor plus a redacted GCPSummary for the transparency line. With no auth step
+// the interceptor owns nothing (and isn't attached); with a step but no identity it
+// still neutralizes the step so the job survives, injecting nothing.
+func buildGCPInterceptor(id *GCPIdentity, steps []*model.Step) (stepInterceptor, GCPSummary) {
 	var targets []string
-	for i, st := range steps {
-		if !isGCPAuth(st) {
-			continue
-		}
+	gcpSteps := interceptSteps(steps, isGCPAuth, gcpAuthNoopMsg, func(st *model.Step) {
 		targets = append(targets, gcpTarget(st))
-		if st.Name == "" {
-			st.Name = st.Uses // keep the original label visible after we clear Uses
+	})
+	env, summary := buildGCP(id, gcpSteps, targets)
+	summary.Steps = stepLabelsOf(steps, gcpSteps)
+
+	itc := stepInterceptor{name: "gcp-auth", steps: gcpSteps, container: gcpBind(id, len(gcpSteps) > 0)}
+	if len(env) > 0 {
+		// info.Env is the live job env map (the same one SetEnv mutates), so writing
+		// here propagates the credential contract to subsequent step execs.
+		itc.inject = func(_ context.Context, info runner.StepBarrierInfo) error {
+			for k, v := range env {
+				info.Env[k] = v
+			}
+			return nil
 		}
-		st.Uses = ""
-		st.With = nil
-		st.Run = `echo "actl: GCP auth intercepted — using ambient identity"`
-		out[i] = true
 	}
-	return out, targets
+	return itc, summary
 }
 
 // gcpTarget describes the federation an auth step declares, for the transparency

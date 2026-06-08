@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
 )
 
@@ -94,6 +95,40 @@ jobs:
 	// pinned checkout (step 1) -> untouched real clone
 	if got := s.Steps()[1]; !strings.HasPrefix(got.Uses, "actions/checkout") {
 		t.Errorf("pinned checkout was altered: Uses=%q", got.Uses)
+	}
+}
+
+// TestInterceptSteps covers the shared scan/rewrite mechanic: a matching step is
+// rewritten to a no-op echoing the message, its label is preserved, non-matching
+// steps are left alone, and `capture` runs before With is cleared.
+func TestInterceptSteps(t *testing.T) {
+	steps := []*model.Step{
+		{ID: "a", Name: "named", Uses: "actions/checkout@v4", With: map[string]string{"x": "y"}},
+		{ID: "b", Uses: "actions/setup-go@v5"}, // no match
+		{ID: "c", Uses: "actions/checkout@v4"}, // matches, no Name → label falls back to Uses
+	}
+	var captured []string
+	match := func(st *model.Step) bool { return strings.HasPrefix(st.Uses, "actions/checkout") }
+	got := interceptSteps(steps, match, checkoutNoopMsg, func(st *model.Step) {
+		captured = append(captured, st.With["x"]) // proves capture sees With before it's cleared
+	})
+
+	if len(got) != 2 || !got[0] || !got[2] {
+		t.Errorf("rewritten indices = %v, want {0,2}", got)
+	}
+	if steps[0].Uses != "" || steps[0].With != nil || steps[0].Run != checkoutNoopMsg {
+		t.Errorf("step 0 not rewritten to no-op: %+v", steps[0])
+	}
+	if steps[0].Name != "named" || steps[2].Name != "actions/checkout@v4" {
+		t.Errorf("labels not preserved: %q, %q", steps[0].Name, steps[2].Name)
+	}
+	if steps[1].Uses != "actions/setup-go@v5" {
+		t.Errorf("non-matching step altered: %q", steps[1].Uses)
+	}
+	// capture fires once per match (two here), and step 0's value proves it sees
+	// With before interceptSteps clears it.
+	if len(captured) != 2 || captured[0] != "y" {
+		t.Errorf("capture = %v, want [y ...] (seen before With cleared)", captured)
 	}
 }
 
@@ -389,19 +424,7 @@ jobs:
 	if got := gcpBind(&GCPIdentity{CredentialFile: "/tmp/adc.json"}, true); !strings.Contains(got, "/tmp/adc.json:"+gcpCredsContainerPath+":ro") {
 		t.Errorf("gcpBind = %q, want the ro credential bind", got)
 	}
-
-	// env injected into the live map at the auth step's position. Note we set neither
-	// GOOGLE_GHA_CREDS_PATH (setup-gcloud would --cred-file an authorized_user ADC and
-	// fail) nor any project (that's the workflow's concern, not the host's).
-	if env := s.gcpEnv; env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath ||
-		env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "ya29.x" {
-		t.Errorf("gcpEnv = %v, want the credential contract", s.gcpEnv)
-	}
-	for _, k := range []string{"GOOGLE_GHA_CREDS_PATH", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"} {
-		if _, ok := s.gcpEnv[k]; ok {
-			t.Errorf("%s must not be set", k)
-		}
-	}
+	// (the env injected at the auth step's position is asserted in TestBuildGCP.)
 }
 
 // TestGCPNoIdentity: an auth step with no ambient credentials is still neutralized
@@ -431,12 +454,10 @@ jobs:
 	if len(sum.Steps) != 1 || sum.File || sum.Token {
 		t.Errorf("GCPSummary = %+v, want one step and nothing injected", sum)
 	}
-	if len(s.gcpEnv) != 0 {
-		t.Errorf("gcpEnv = %v, want empty without creds", s.gcpEnv)
-	}
 	if got := gcpBind(nil, true); got != "" {
 		t.Errorf("gcpBind(nil) = %q, want empty without a credential file", got)
 	}
+	// (the no-identity env path — neutralized step, nothing injected — is asserted in TestBuildGCP.)
 }
 
 // TestBuildGCP unit-tests the env/summary assembly directly across the partial-creds
@@ -448,6 +469,12 @@ func TestBuildGCP(t *testing.T) {
 	// no auth steps -> empty, even with an identity
 	if env, sum := buildGCP(&GCPIdentity{AccessToken: "t"}, nil, nil); env != nil || len(sum.Steps) != 0 || sum.Token {
 		t.Errorf("no steps: env=%v sum=%+v, want empty", env, sum)
+	}
+
+	// auth step present but no identity -> nothing injected (the step is still
+	// neutralized at the New layer; here buildGCP just yields no env).
+	if env, sum := buildGCP(nil, steps, targets); env != nil || sum.File || sum.Token {
+		t.Errorf("no-identity: env=%v sum=%+v, want nil env, nothing injected", env, sum)
 	}
 
 	// token only -> CLOUDSDK token, no file
@@ -463,6 +490,19 @@ func TestBuildGCP(t *testing.T) {
 	env, sum = buildGCP(&GCPIdentity{CredentialFile: "/x"}, steps, targets)
 	if env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath || !sum.File || sum.Token {
 		t.Errorf("file-only: env=%v sum=%+v", env, sum)
+	}
+
+	// full identity -> both surfaces of the contract, and NEITHER a project nor
+	// GOOGLE_GHA_CREDS_PATH (setup-gcloud would --cred-file an authorized_user ADC
+	// and fail; the project is the workflow's concern, not the host's).
+	env, sum = buildGCP(&GCPIdentity{CredentialFile: "/x", AccessToken: "ya29.x"}, steps, targets)
+	if env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath || env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "ya29.x" || !sum.File || !sum.Token {
+		t.Errorf("full: env=%v sum=%+v, want the full credential contract", env, sum)
+	}
+	for _, k := range []string{"GOOGLE_GHA_CREDS_PATH", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s must not be set", k)
+		}
 	}
 
 	// targets carried through regardless of identity
