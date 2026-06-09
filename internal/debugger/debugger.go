@@ -79,6 +79,20 @@ type GCPIdentity struct {
 	Account        string // local identity, for the transparency line (best-effort, may be empty)
 }
 
+// AWSIdentity is the host-resolved ambient AWS credentials the CLI passes in for
+// identity substitution (CLAUDE.md §4), the AWS analog of GCPIdentity. Locally there
+// is no GitHub OIDC issuer, so `aws-actions/configure-aws-credentials` can't federate
+// a role; instead we intercept that step and inject the dev's already-resolved
+// session credentials (e.g. from `aws configure export-credentials`). Unlike GCP these
+// are env-only — no file is mounted — so the core just injects them at the step's
+// position. Discovery is a host concern (cmd/actl); the core only consumes the data.
+type AWSIdentity struct {
+	AccessKeyID     string // → AWS_ACCESS_KEY_ID
+	SecretAccessKey string // → AWS_SECRET_ACCESS_KEY
+	SessionToken    string // → AWS_SESSION_TOKEN (empty for long-lived creds)
+	Account         string // local caller identity (arn), for the transparency line (best-effort)
+}
+
 // TokenSummary is a redacted view of the GITHUB_TOKEN substitution for a
 // transparency line: whether github.token was set and where it came from, never
 // the token itself.
@@ -127,6 +141,19 @@ type GCPSummary struct {
 	Token   bool     // an access token was injected
 }
 
+// AWSSummary is a redacted view of the AWS identity substitution for a transparency
+// line, the AWS analog of GCPSummary: which auth steps were intercepted, the role +
+// region each would have federated as in real CI, and the local identity we run as.
+// No credential material is retained here.
+type AWSSummary struct {
+	Steps     []string // intercepted aws-actions/configure-aws-credentials step labels
+	Targets   []string // "<role-to-assume> in <region>" per step (as declared)
+	Account   string   // local caller arn we run as ("" if unknown)
+	Region    string   // the declared aws-region actl honors ("" if none / an expression)
+	Creds     bool     // ambient credentials were injected
+	RegionSet bool     // AWS_REGION/AWS_DEFAULT_REGION were injected from the declared region
+}
+
 // container path the ambient ADC file is mounted at (matches the env we inject).
 const gcpCredsContainerPath = "/actl/gcp/adc.json"
 
@@ -143,6 +170,7 @@ type Options struct {
 	Vars         map[string]string     // vars.* exposed to the workflow
 	Env          map[string]string     // extra env for containers
 	GCP          *GCPIdentity          // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
+	AWS          *AWSIdentity          // ambient AWS creds to substitute for a federated aws-actions/configure-aws-credentials (nil = leave auth steps untouched)
 	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
 	BreakOnError bool                  // in Continue mode, halt after a step that errored
 	Breakpoints  []int                 // zero-based step indices to halt before, in Continue mode
@@ -208,6 +236,7 @@ type Session struct {
 	checkoutSource string               // host tree copied into the workspace at checkout (empty unless copy mode)
 	configSummary  ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
 	gcpSummary     GCPSummary           // redacted view of the GCP identity substitution (for transparency)
+	awsSummary     AWSSummary           // redacted view of the AWS identity substitution (for transparency)
 	tokenSummary   TokenSummary         // how github.token was satisfied (for transparency)
 	inputsSummary  InputsSummary        // declared/supplied workflow inputs (for transparency)
 	eventSummary   EventSummary         // the github.event payload backing the run (for transparency)
@@ -309,6 +338,12 @@ func New(opts Options) (*Session, error) {
 	// step is still neutralized and non-cloud steps stay debuggable.
 	gcpItc, gcpSummary := buildGCPInterceptor(opts.GCP, steps)
 
+	// Ambient AWS identity substitution (CLAUDE.md §4), same shape as GCP: a federated
+	// aws-actions/configure-aws-credentials can't assume a role via a GitHub OIDC token
+	// locally, so the interceptor rewrites it to a no-op and (given ambient creds)
+	// injects them — and the step's declared aws-region — at its position.
+	awsItc, awsSummary := buildAWSInterceptor(opts.AWS, steps)
+
 	// Runtime context GitHub injects that a clean local runner lacks (CLAUDE.md §4):
 	// GITHUB_TOKEN, workflow inputs, the event payload, and the github.* context.
 	// Each is seeded here and reported via a transparency line; none needs a fork patch.
@@ -373,6 +408,9 @@ func New(opts Options) (*Session, error) {
 	if len(gcpItc.steps) > 0 {
 		interceptors = append(interceptors, gcpItc)
 	}
+	if len(awsItc.steps) > 0 {
+		interceptors = append(interceptors, awsItc)
+	}
 
 	breakpoints := make(map[int]bool, len(opts.Breakpoints))
 	for _, i := range opts.Breakpoints {
@@ -391,6 +429,7 @@ func New(opts Options) (*Session, error) {
 		checkoutSource: checkoutSource,
 		configSummary:  summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
 		gcpSummary:     gcpSummary,
+		awsSummary:     awsSummary,
 		tokenSummary:   tokenSummary,
 		inputsSummary:  inputsSummary,
 		eventSummary:   eventSummary,
@@ -495,6 +534,11 @@ func (s *Session) ConfigSummary() ConfigSummary { return s.configSummary }
 // auth steps were intercepted, the federation target vs the local identity), for a
 // transparency line. Its Steps are empty when the job has no auth step.
 func (s *Session) GCPSummary() GCPSummary { return s.gcpSummary }
+
+// AWSSummary returns the redacted view of the AWS identity substitution (which auth
+// steps were intercepted, the role+region vs the local identity), for a transparency
+// line. Its Steps are empty when the job has no aws-actions/configure-aws-credentials step.
+func (s *Session) AWSSummary() AWSSummary { return s.awsSummary }
 
 // TokenSummary reports how github.token was satisfied (set from a flag/secret, or
 // absent), for a transparency line.
@@ -781,6 +825,7 @@ type stepInterceptor struct {
 const (
 	checkoutNoopMsg = `echo "actl: checkout intercepted — using your local working tree"`
 	gcpAuthNoopMsg  = `echo "actl: GCP auth intercepted — using ambient identity"`
+	awsAuthNoopMsg  = `echo "actl: AWS auth intercepted — using ambient identity"`
 )
 
 // interceptSteps rewrites every step matching `match` to a no-op echoing `msg`,
@@ -908,6 +953,99 @@ func gcpBind(id *GCPIdentity, hasAuthSteps bool) string {
 		return ""
 	}
 	return fmt.Sprintf("-v %s:%s:ro", id.CredentialFile, gcpCredsContainerPath)
+}
+
+// isAWSAuth reports whether a step uses aws-actions/configure-aws-credentials (any version).
+func isAWSAuth(st *model.Step) bool {
+	return st.Uses == "aws-actions/configure-aws-credentials" || strings.HasPrefix(st.Uses, "aws-actions/configure-aws-credentials@")
+}
+
+// awsTarget describes the federation an auth step declares (role + region), for the
+// transparency line — read before we clear With. Falls back to a generic label.
+func awsTarget(st *model.Step) string {
+	role := st.With["role-to-assume"]
+	region := st.With["aws-region"]
+	switch {
+	case role != "" && region != "":
+		return role + " in " + region
+	case role != "":
+		return role
+	case region != "":
+		return "region " + region
+	default:
+		return "(static credentials)"
+	}
+}
+
+// buildAWSInterceptor scans and rewrites each aws-actions/configure-aws-credentials
+// step to a no-op (so it doesn't try to assume a role via a GitHub OIDC token that
+// can't be minted locally), then assembles the substitution: the ambient session
+// credentials to inject at the step's position plus the region the step declared.
+// Returns the interceptor and a redacted AWSSummary. AWS is env-only — no file mount
+// — so unlike GCP the interceptor sets no container option.
+func buildAWSInterceptor(id *AWSIdentity, steps []*model.Step) (stepInterceptor, AWSSummary) {
+	var targets []string
+	var region string
+	awsSteps := interceptSteps(steps, isAWSAuth, awsAuthNoopMsg, func(st *model.Step) {
+		targets = append(targets, awsTarget(st))
+		// Capture the first declared literal region; the action exports it, so
+		// reproducing it is faithful (unlike GCP's project, region is a declared input
+		// here). Skip expressions — we'd inject the raw unevaluated string otherwise.
+		if region == "" {
+			if r := st.With["aws-region"]; r != "" && !strings.Contains(r, "${{") {
+				region = r
+			}
+		}
+	})
+	env, summary := buildAWS(id, awsSteps, targets, region)
+	summary.Steps = stepLabelsOf(steps, awsSteps)
+
+	itc := stepInterceptor{name: "aws-auth", steps: awsSteps}
+	if len(env) > 0 {
+		// info.Env is the live job env map (the same one SetEnv mutates), so writing
+		// here propagates the credential contract to subsequent step execs.
+		itc.inject = func(_ context.Context, info runner.StepBarrierInfo) error {
+			for k, v := range env {
+				info.Env[k] = v
+			}
+			return nil
+		}
+	}
+	return itc, summary
+}
+
+// buildAWS assembles the credential env injected at the auth step's position and a
+// redacted summary for the transparency line. With no identity (id == nil) it returns
+// no env but still summarizes the intercepted steps, so the UI can say the steps were
+// neutralized but cloud calls will fail. The region (from the step's declared
+// aws-region) is injected only alongside credentials — region without creds is useless.
+func buildAWS(id *AWSIdentity, steps map[int]bool, targets []string, region string) (map[string]string, AWSSummary) {
+	summary := AWSSummary{Targets: targets, Region: region}
+	if len(steps) == 0 {
+		return nil, AWSSummary{} // no auth step → nothing to report
+	}
+	if id == nil {
+		return nil, summary
+	}
+	env := map[string]string{}
+	if id.AccessKeyID != "" && id.SecretAccessKey != "" {
+		env["AWS_ACCESS_KEY_ID"] = id.AccessKeyID
+		env["AWS_SECRET_ACCESS_KEY"] = id.SecretAccessKey
+		summary.Creds = true
+		if id.SessionToken != "" {
+			env["AWS_SESSION_TOKEN"] = id.SessionToken // temporary (SSO / assumed-role) creds
+		}
+		if region != "" {
+			env["AWS_REGION"] = region
+			env["AWS_DEFAULT_REGION"] = region
+			summary.RegionSet = true
+		}
+	}
+	summary.Account = id.Account
+	if len(env) == 0 {
+		env = nil
+	}
+	return env, summary
 }
 
 // stepLabelsOf returns the labels of the steps whose indices are set in mark, in

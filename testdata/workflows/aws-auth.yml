@@ -1,0 +1,48 @@
+# Demonstrates ambient AWS identity substitution. In real CI the auth step below
+# federates a GitHub OIDC token into short-lived AWS credentials by assuming an IAM
+# role; locally there is no OIDC issuer, so actl intercepts the step and injects your
+# ambient AWS session instead (run `aws sso login` first, or have a profile set). It
+# also honors the step's declared aws-region (the action exports it). The TUI prints a
+# transparency line: the role + region it would federate as vs the local identity it
+# runs as. Disable with -aws-identity=false; pick a profile with -aws-profile NAME.
+#
+#   aws sso login            # or: export AWS_PROFILE=your-profile
+#   go run ./cmd/actl testdata/workflows/aws-auth.yml
+#
+# The role-to-assume below is a placeholder — only the presence of
+# aws-actions/configure-aws-credentials matters for the local substitution. You test
+# the steps under YOUR permissions, not the workflow's federated role (that tradeoff,
+# surfaced in the transparency line, is the point of ambient substitution).
+#
+# Note: unlike the GCP sample there is no "setup" step — the AWS CLI is pre-installed
+# on GitHub runners, so real workflows don't install it (there's no idiomatic action
+# to). The `aws ...` steps below therefore need the `aws` binary in the runner IMAGE.
+# The default catthehacker medium image doesn't carry it, so a step fails with
+# "aws: command not found" — that's image parity, NOT the credential substitution
+# (the creds + region did land in the env). The faithful fix is to run on a
+# runner-parity image, exactly as GitHub provisions one that has aws:
+#
+#   go run ./cmd/actl -image catthehacker/ubuntu:full-latest testdata/workflows/aws-auth.yml
+#
+# (the full image is a large first pull). Supplying that image per-project will live in
+# .actl.yml so you don't repeat -image every run.
+name: aws-auth
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/actl-sample-deploy
+          aws-region: us-east-1
+      - name: who am i (as the ambient identity)
+        run: aws sts get-caller-identity
+      - name: read-only call
+        run: aws s3 ls

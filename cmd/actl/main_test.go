@@ -80,6 +80,15 @@ func TestWorkflowHasGCPAuth(t *testing.T) {
 	}
 }
 
+func TestWorkflowHasAWSAuth(t *testing.T) {
+	if !workflowHasAWSAuth("../../testdata/workflows/aws-auth.yml") {
+		t.Error("aws-auth.yml: want true")
+	}
+	if workflowHasAWSAuth("../../testdata/workflows/config.yml") {
+		t.Error("config.yml: want false (no auth step)")
+	}
+}
+
 func TestParseNeeds(t *testing.T) {
 	in := []string{
 		"build.outputs.image=repo/app:abc",

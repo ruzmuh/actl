@@ -47,6 +47,8 @@ func main() {
 	envFile := flag.String("env-file", ".env", "dotenv file of env vars (skipped if absent)")
 	gcpIdentity := flag.Bool("gcp-identity", true, "substitute ambient gcloud ADC for a federated google-github-actions/auth step (=false leaves it untouched)")
 	gcpCreds := flag.String("gcp-credentials", "", "path to the ADC json to inject (default: discover gcloud's application_default_credentials.json)")
+	awsIdentity := flag.Bool("aws-identity", true, "substitute ambient AWS credentials for a federated aws-actions/configure-aws-credentials step (=false leaves it untouched)")
+	awsProfile := flag.String("aws-profile", "", "AWS profile to resolve ambient credentials from (default: the default profile / environment)")
 	githubToken := flag.String("github-token", "", "value for github.token / secrets.GITHUB_TOKEN (default: GITHUB_TOKEN from .secrets, else ambient 'gh auth token')")
 	eventFile := flag.String("event-file", "", "path to a github.event payload JSON (sets github.event.*)")
 	repository := flag.String("repository", "", "override github.repository (default: derive owner/repo from the local git 'origin' remote)")
@@ -98,6 +100,13 @@ func main() {
 		gcp = gatherGCPIdentity(path, *gcpCreds)
 	}
 
+	// Ambient AWS identity: same laziness — only resolved (and the aws CLI invoked)
+	// when the workflow actually has an aws-actions/configure-aws-credentials step.
+	var aws *debugger.AWSIdentity
+	if *awsIdentity {
+		aws = gatherAWSIdentity(path, *awsProfile)
+	}
+
 	// github.token: explicit flag wins; the core falls back to a GITHUB_TOKEN in
 	// .secrets; failing both, try the dev's ambient `gh` login (best-effort, like
 	// gcloud for GCP). The transparency line makes the substitution loud.
@@ -126,6 +135,7 @@ func main() {
 		Vars:         varMap,
 		Env:          envMap,
 		GCP:          gcp,
+		AWS:          aws,
 		GitHubToken:  token,
 		Inputs:       parseKeyVals(inputs),
 		EventPath:    *eventFile,
@@ -232,6 +242,71 @@ func workflowHasGCPAuth(path string) bool {
 		}
 	}
 	return false
+}
+
+// gatherAWSIdentity resolves the dev's ambient AWS credentials for substitution, but
+// only when the workflow has an aws-actions/configure-aws-credentials step — so a
+// non-AWS run never shells out to the aws CLI. Best-effort, like gatherGCPIdentity: it
+// runs `aws configure export-credentials` to resolve whatever the ambient session is
+// (static keys, SSO, an already-assumed role) into concrete credentials. Returns nil
+// when there's no auth step or no resolvable credentials.
+func gatherAWSIdentity(path, profile string) *debugger.AWSIdentity {
+	if !workflowHasAWSAuth(path) {
+		return nil
+	}
+	creds := awsExportCredentials(profile)
+	if creds["AWS_ACCESS_KEY_ID"] == "" || creds["AWS_SECRET_ACCESS_KEY"] == "" {
+		return nil
+	}
+	return &debugger.AWSIdentity{
+		AccessKeyID:     creds["AWS_ACCESS_KEY_ID"],
+		SecretAccessKey: creds["AWS_SECRET_ACCESS_KEY"],
+		SessionToken:    creds["AWS_SESSION_TOKEN"],
+		Account:         awsValue(profile, "sts", "get-caller-identity", "--query", "Arn", "--output", "text"),
+	}
+}
+
+// workflowHasAWSAuth reports whether any job uses aws-actions/configure-aws-credentials
+// (a cheap pre-scan to keep the aws CLI invocation lazy).
+func workflowHasAWSAuth(path string) bool {
+	wf, err := workflow.Load(path, true)
+	if err != nil {
+		return false // a real parse error surfaces later in debugger.New
+	}
+	for _, job := range wf.Jobs {
+		for _, st := range job.Steps {
+			if st.Uses == "aws-actions/configure-aws-credentials" || strings.HasPrefix(st.Uses, "aws-actions/configure-aws-credentials@") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// awsExportCredentials runs `aws configure export-credentials --format env-no-export`
+// and parses its KEY=VALUE lines (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+// AWS_SESSION_TOKEN / …). Returns nil on any error (aws absent, no creds, an older CLI
+// without export-credentials).
+func awsExportCredentials(profile string) map[string]string {
+	out := awsValue(profile, "configure", "export-credentials", "--format", "env-no-export")
+	if out == "" {
+		return nil
+	}
+	return parseKeyVals(strings.Split(out, "\n"))
+}
+
+// awsValue runs `aws <args...>` (under the given profile, if any) and returns the
+// trimmed stdout, or "" on any error — best-effort, like gcloudValue.
+func awsValue(profile string, args ...string) string {
+	cmd := exec.Command("aws", args...)
+	if profile != "" {
+		cmd.Env = append(os.Environ(), "AWS_PROFILE="+profile)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // findADCFile locates the Application Default Credentials json, preferring an

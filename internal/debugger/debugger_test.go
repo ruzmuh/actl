@@ -511,6 +511,147 @@ func TestBuildGCP(t *testing.T) {
 	}
 }
 
+// TestInterceptAWSAuth mirrors TestInterceptGCPAuth: aws-actions/configure-aws-
+// credentials is rewritten to a no-op, keeps a visible label, its declared role+region
+// target is captured, and the ambient credentials + region are summarized.
+func TestInterceptAWSAuth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aws.yml")
+	const wf = `name: aws
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - id: auth
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/deploy
+          aws-region: eu-west-1
+      - run: aws s3 ls
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir(),
+		AWS: &AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret", SessionToken: "tok", Account: "arn:aws:iam::1:user/me"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
+		t.Errorf("auth step not rewritten: Uses=%q Run=%q", got.Uses, got.Run)
+	}
+	sum := s.AWSSummary()
+	if len(sum.Steps) != 1 || sum.Steps[0] != "aws-actions/configure-aws-credentials@v4" {
+		t.Errorf("AWSSummary.Steps = %v", sum.Steps)
+	}
+	want := "arn:aws:iam::123456789012:role/deploy in eu-west-1"
+	if len(sum.Targets) != 1 || sum.Targets[0] != want {
+		t.Errorf("AWSSummary.Targets = %v, want [%q]", sum.Targets, want)
+	}
+	if !sum.Creds || !sum.RegionSet || sum.Region != "eu-west-1" || sum.Account != "arn:aws:iam::1:user/me" {
+		t.Errorf("AWSSummary = %+v, want creds+region from the declared step", sum)
+	}
+	// (the injected env contract is asserted directly in TestBuildAWS.)
+}
+
+// TestAWSNoIdentity: an auth step with no ambient credentials is still neutralized
+// (so the job survives), but nothing is injected and the summary says so.
+func TestAWSNoIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aws.yml")
+	const wf = `name: aws
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+      - run: echo hi
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir()}) // AWS nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
+		t.Errorf("auth step should still be neutralized without creds: Uses=%q", got.Uses)
+	}
+	if sum := s.AWSSummary(); len(sum.Steps) != 1 || sum.Creds || sum.RegionSet {
+		t.Errorf("AWSSummary = %+v, want one step and nothing injected", sum)
+	}
+}
+
+// TestAWSRegionExpression covers the deliberate choice to honor only a literal
+// aws-region: an expression is left to act (we'd inject the raw unevaluated string).
+func TestAWSRegionExpression(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aws.yml")
+	const wf = `name: aws
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.REGION }}
+      - run: aws s3 ls
+`
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir(),
+		AWS: &AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum := s.AWSSummary(); sum.RegionSet || sum.Region != "" {
+		t.Errorf("AWSSummary = %+v, want no region injected for an expression", sum)
+	}
+}
+
+// TestBuildAWS unit-tests the env/summary assembly directly across the cases
+// (no steps, no identity, full creds+region, long-lived creds) without touching act.
+func TestBuildAWS(t *testing.T) {
+	steps := map[int]bool{1: true}
+	targets := []string{"role in eu-west-1"}
+
+	// no auth steps -> empty, even with an identity
+	if env, sum := buildAWS(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "s"}, nil, nil, "eu-west-1"); env != nil || len(sum.Steps) != 0 || sum.Creds {
+		t.Errorf("no steps: env=%v sum=%+v, want empty", env, sum)
+	}
+
+	// auth step present but no identity -> nothing injected
+	if env, sum := buildAWS(nil, steps, targets, "eu-west-1"); env != nil || sum.Creds || sum.RegionSet {
+		t.Errorf("no-identity: env=%v sum=%+v, want nil env", env, sum)
+	}
+
+	// full session creds + literal region -> the env contract, both region keys
+	env, sum := buildAWS(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret", SessionToken: "tok"}, steps, targets, "eu-west-1")
+	if env["AWS_ACCESS_KEY_ID"] != "AKIA" || env["AWS_SECRET_ACCESS_KEY"] != "secret" || env["AWS_SESSION_TOKEN"] != "tok" {
+		t.Errorf("creds: env=%v", env)
+	}
+	if env["AWS_REGION"] != "eu-west-1" || env["AWS_DEFAULT_REGION"] != "eu-west-1" || !sum.RegionSet {
+		t.Errorf("region not injected: env=%v sum=%+v", env, sum)
+	}
+	if !sum.Creds || sum.Region != "eu-west-1" {
+		t.Errorf("summary = %+v", sum)
+	}
+	if len(sum.Targets) != 1 || sum.Targets[0] != "role in eu-west-1" {
+		t.Errorf("targets = %v, want carried through", sum.Targets)
+	}
+
+	// long-lived creds (no session token), no region -> neither optional key set
+	env, _ = buildAWS(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret"}, steps, targets, "")
+	if _, ok := env["AWS_SESSION_TOKEN"]; ok {
+		t.Error("no session token should not set AWS_SESSION_TOKEN")
+	}
+	if _, ok := env["AWS_REGION"]; ok {
+		t.Error("empty region should not set AWS_REGION")
+	}
+}
+
 func TestGitContextNoiseFiltered(t *testing.T) {
 	drop := []string{
 		"path/tmp/actl-123not located inside a git repository",

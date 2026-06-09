@@ -137,6 +137,7 @@ func noticeLines(sess *debugger.Session) []string {
 		}
 	}
 	lines = append(lines, gcpLines(sess.GCPSummary())...)
+	lines = append(lines, awsLines(sess.AWSSummary())...)
 	return lines
 }
 
@@ -176,6 +177,37 @@ func gcpLines(g debugger.GCPSummary) []string {
 	// has its own actionable message.
 	if g.File || g.Token {
 		lines = append(lines, "gcp identity: no project set by actl — pass GOOGLE_CLOUD_PROJECT via -env if a step needs one")
+	}
+	return lines
+}
+
+// awsLines renders the AWS identity substitution: the role+region each auth step
+// would have federated as in real CI vs the local identity we run as, and what we
+// injected. The AWS analog of gcpLines (CLAUDE.md §4). Empty when the job has no
+// aws-actions/configure-aws-credentials step.
+func awsLines(a debugger.AWSSummary) []string {
+	if len(a.Steps) == 0 {
+		return nil
+	}
+	local := a.Account
+	if local == "" {
+		local = "your ambient AWS identity"
+	}
+	var lines []string
+	for i, step := range a.Steps {
+		target := "(federated identity)"
+		if i < len(a.Targets) {
+			target = a.Targets[i]
+		}
+		lines = append(lines, fmt.Sprintf("aws identity (%s): would federate as %s → running locally as %s", step, target, local))
+	}
+	switch {
+	case a.Creds && a.RegionSet:
+		lines = append(lines, fmt.Sprintf("aws identity: injected ambient credentials + region %s into the job", a.Region))
+	case a.Creds:
+		lines = append(lines, "aws identity: injected ambient credentials into the job — no region set; pass AWS_REGION via -env if a step needs one")
+	default:
+		lines = append(lines, "aws identity: no ambient credentials found — cloud calls will fail (run: aws sso login, or set -aws-profile)")
 	}
 	return lines
 }
