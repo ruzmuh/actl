@@ -21,14 +21,48 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/moby/moby/client"
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/container"
 	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
 )
 
 // ErrAborted is the run error when the front-end aborts via Abort.
 var ErrAborted = errors.New("debugger: run aborted by user")
+
+// DockerUnavailableError is returned by New when the Docker daemon can't be
+// reached. act execs every step into a real job container, so a running daemon
+// is a hard prerequisite; surfacing it up front (with a friendly message) beats
+// act's cryptic mid-run failure. Cause is the underlying connection/ping error.
+type DockerUnavailableError struct{ Cause error }
+
+func (e *DockerUnavailableError) Error() string {
+	return fmt.Sprintf("Docker is not reachable — is the Docker daemon running? "+
+		"(set DOCKER_HOST if it runs elsewhere): %v", e.Cause)
+}
+
+func (e *DockerUnavailableError) Unwrap() error { return e.Cause }
+
+// dockerPreflight verifies the Docker daemon is reachable. GetDockerClient alone
+// is not enough: client.New(FromEnv) constructs lazily and succeeds without ever
+// contacting the daemon, so we Ping to actually confirm it's up, under a short
+// timeout so a dead socket can't hang the startup.
+func dockerPreflight() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cli, err := container.GetDockerClient(ctx)
+	if err != nil {
+		return &DockerUnavailableError{Cause: err}
+	}
+	defer cli.Close()
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		return &DockerUnavailableError{Cause: err}
+	}
+	return nil
+}
 
 // MultipleJobsError is returned by New when the workflow has more than one job
 // and Options.JobID did not pick one. It lists the available job ids so a
@@ -291,6 +325,13 @@ func New(opts Options) (*Session, error) {
 	}
 	run, err := selectRun(plan, opts.JobID)
 	if err != nil {
+		return nil, err
+	}
+
+	// Past the pure-invocation errors (parse, MultipleJobsError, unknown job),
+	// we're about to need a container — fail fast with a friendly message if the
+	// daemon is down rather than letting act stumble on it deep in the run.
+	if err := dockerPreflight(); err != nil {
 		return nil, err
 	}
 

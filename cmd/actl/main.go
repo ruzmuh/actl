@@ -67,9 +67,10 @@ func main() {
 	}
 	flag.Parse()
 
-	path := "testdata/workflows/sample.yml"
-	if flag.NArg() > 0 {
-		path = flag.Arg(0)
+	path, err := resolveWorkflowPath(flag.Arg(0))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "actl:", err)
+		os.Exit(2)
 	}
 
 	needsMap, err := parseNeeds(needs)
@@ -148,6 +149,30 @@ func main() {
 	if err := run(opts); err != nil {
 		fmt.Fprintln(os.Stderr, "actl:", err)
 		os.Exit(1)
+	}
+}
+
+// resolveWorkflowPath decides which workflow to debug. An explicit path argument
+// wins. Otherwise it auto-discovers .github/workflows/*.{yml,yaml} in the current
+// directory: exactly one is used (with an honest note on stderr); none or several
+// is a friendly error telling the user to pass one explicitly — mirroring how
+// -job handles a multi-job workflow.
+func resolveWorkflowPath(arg string) (string, error) {
+	if arg != "" {
+		return arg, nil
+	}
+	found, err := workflow.Discover(".")
+	if err != nil {
+		return "", err
+	}
+	switch len(found) {
+	case 0:
+		return "", errors.New("no workflow found in ./.github/workflows — pass one explicitly: actl path/to/workflow.yml")
+	case 1:
+		fmt.Fprintf(os.Stderr, "actl: debugging %s (the only workflow found)\n", found[0])
+		return found[0], nil
+	default:
+		return "", fmt.Errorf("found %d workflows; pass one explicitly: %s", len(found), strings.Join(found, ", "))
 	}
 }
 

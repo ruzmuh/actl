@@ -7,9 +7,38 @@ package workflow
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 
 	"github.com/nektos/act/pkg/model"
 )
+
+// Discover returns the workflow files under dir/.github/workflows, sorted. It
+// matches GitHub's own convention (*.yml and *.yaml in that directory). A
+// missing .github/workflows directory is not an error — it yields an empty
+// slice, so the caller can give a friendly "no workflow found" message.
+func Discover(dir string) ([]string, error) {
+	wfDir := filepath.Join(dir, ".github", "workflows")
+	entries, err := os.ReadDir(wfDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", wfDir, err)
+	}
+	var paths []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		switch filepath.Ext(e.Name()) {
+		case ".yml", ".yaml":
+			paths = append(paths, filepath.Join(wfDir, e.Name()))
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
 
 // Load reads and parses a single workflow file using act's parser.
 //

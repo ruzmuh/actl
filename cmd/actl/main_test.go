@@ -3,8 +3,79 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestResolveWorkflowPath(t *testing.T) {
+	// An explicit argument always wins, no discovery.
+	t.Run("explicit arg passes through", func(t *testing.T) {
+		got, err := resolveWorkflowPath("some/where.yml")
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if got != "some/where.yml" {
+			t.Errorf("got %q, want the explicit arg", got)
+		}
+	})
+
+	// The discovery branches all scan ".", so run them from a temp cwd.
+	t.Run("one discovered", func(t *testing.T) {
+		chdir(t, withWorkflows(t, "ci.yml"))
+		got, err := resolveWorkflowPath("")
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if want := filepath.Join(".github", "workflows", "ci.yml"); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("none discovered", func(t *testing.T) {
+		chdir(t, t.TempDir())
+		_, err := resolveWorkflowPath("")
+		if err == nil || !strings.Contains(err.Error(), "no workflow found") {
+			t.Fatalf("want a 'no workflow found' error, got %v", err)
+		}
+	})
+
+	t.Run("several discovered", func(t *testing.T) {
+		chdir(t, withWorkflows(t, "a.yml", "b.yml"))
+		_, err := resolveWorkflowPath("")
+		if err == nil || !strings.Contains(err.Error(), "found 2 workflows") {
+			t.Fatalf("want a multi-workflow error, got %v", err)
+		}
+	})
+}
+
+// withWorkflows makes a temp dir holding .github/workflows/<names...> and returns it.
+func withWorkflows(t *testing.T, names ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	wfDir := filepath.Join(dir, ".github", "workflows")
+	if err := os.MkdirAll(wfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(wfDir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// chdir switches into dir for the test and restores the cwd afterward.
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(prev) })
+}
 
 func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()

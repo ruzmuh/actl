@@ -14,6 +14,17 @@ import (
 
 const sampleWorkflow = "../../testdata/workflows/sample.yml"
 
+func TestDockerUnavailableError(t *testing.T) {
+	cause := errors.New("dial /var/run/docker.sock: connect: connection refused")
+	err := &DockerUnavailableError{Cause: cause}
+	if !strings.Contains(err.Error(), "Docker daemon running") {
+		t.Errorf("message %q lacks the friendly hint", err.Error())
+	}
+	if !errors.Is(err, cause) {
+		t.Error("DockerUnavailableError should unwrap to its cause")
+	}
+}
+
 // barrier must satisfy the soft-fork StepBarrier signature. This line is the
 // fork smoke guard: a bad rebase that drops the patch fails to compile here.
 var _ runner.StepBarrier = (&Session{}).barrier
