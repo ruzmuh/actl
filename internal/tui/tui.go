@@ -136,9 +136,23 @@ func noticeLines(sess *debugger.Session) []string {
 			lines = append(lines, fmt.Sprintf("checkout intercepted (%s) — using the mounted workspace", strings.Join(steps, ", ")))
 		}
 	}
+	if svc := servicesLine(sess.ServicesSummary()); svc != "" {
+		lines = append(lines, svc)
+	}
 	lines = append(lines, gcpLines(sess.GCPSummary())...)
 	lines = append(lines, awsLines(sess.AWSSummary())...)
 	return lines
+}
+
+// servicesLine renders the job's `services:` containers. act starts them natively
+// when the job runs; we just note they will start so their appearance isn't a
+// surprise. Empty when the job declares no services.
+func servicesLine(s debugger.ServicesSummary) string {
+	if len(s.Names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("services: act will start %d service container(s): %s",
+		len(s.Names), strings.Join(s.Names, ", "))
 }
 
 // gcpLines renders the GCP identity substitution: the federation each auth step

@@ -55,7 +55,8 @@ func main() {
 	ref := flag.String("ref", "", "override github.ref, e.g. refs/heads/main (default: derive from the local git HEAD)")
 	sha := flag.String("sha", "", "override github.sha (default: derive from the local git HEAD)")
 	actor := flag.String("actor", "", "override github.actor (default: act's 'nektos/act' placeholder)")
-	var needs, envs, secrets, vars, inputs stringSlice
+	var needs, envs, secrets, vars, inputs, matrix stringSlice
+	flag.Var(&matrix, "matrix", "pin a matrix combination: 'KEY=VALUE' (repeatable; required only if the job's matrix has more than one combination)")
 	flag.Var(&needs, "need", "seed an upstream needs value: 'JOB.outputs.NAME=VALUE' or 'JOB.result=VALUE' (repeatable)")
 	flag.Var(&envs, "env", "set an env var for the run: 'KEY=VALUE' (repeatable, overrides -env-file)")
 	flag.Var(&secrets, "secret", "set a secret for the run: 'KEY=VALUE' (repeatable, overrides -secret-file)")
@@ -126,6 +127,7 @@ func main() {
 		WorkflowPath: path,
 		EventName:    *event,
 		JobID:        *job,
+		Matrix:       parseMatrixSel(matrix),
 		WithDeps:     *withDeps,
 		Workdir:      *workdir,
 		Source:       *source,
@@ -453,12 +455,35 @@ func parseKeyVals(entries []string) map[string]string {
 	return out
 }
 
+// parseMatrixSel turns repeated 'KEY=VALUE' matrix flags into act's Config.Matrix
+// shape (key→value→true). Repeating a key allows several values for it (e.g.
+// -matrix os=ubuntu-latest -matrix os=macos-latest). We use '=' (not act's CLI ':')
+// to stay consistent with -secret/-var/-env/-input.
+func parseMatrixSel(entries []string) map[string]map[string]bool {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := map[string]map[string]bool{}
+	for _, e := range entries {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			if out[k] == nil {
+				out[k] = map[string]bool{}
+			}
+			out[k][v] = true
+		}
+	}
+	return out
+}
+
 func run(opts debugger.Options) error {
 	sess, err := debugger.New(opts)
 	if err != nil {
-		var multi *debugger.MultipleJobsError
-		if errors.As(err, &multi) {
-			fmt.Fprintf(os.Stderr, "actl: %v\n", multi)
+		// Selection ambiguities (which job / which matrix combo) aren't failures —
+		// list the choices and exit 2 so the user re-runs with -job / -matrix.
+		var multiJob *debugger.MultipleJobsError
+		var multiMatrix *debugger.MultipleMatrixError
+		if errors.As(err, &multiJob) || errors.As(err, &multiMatrix) {
+			fmt.Fprintf(os.Stderr, "actl: %v\n", err)
 			os.Exit(2)
 		}
 		return err

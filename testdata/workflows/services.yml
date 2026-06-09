@@ -1,0 +1,17 @@
+name: services
+on: push
+
+jobs:
+  it:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+      redis:
+        image: redis
+    steps:
+      - run: echo "running with services"

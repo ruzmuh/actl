@@ -1,0 +1,12 @@
+name: matrix
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.21', '1.22']
+    steps:
+      - run: echo "os=${{ matrix.os }} go=${{ matrix.go }}"

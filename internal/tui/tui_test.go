@@ -260,6 +260,18 @@ func TestRuntimeContextLines(t *testing.T) {
 	}
 }
 
+// TestServicesLines locks the services transparency: one line naming the containers
+// act will start, and nothing when the job declares no services.
+func TestServicesLines(t *testing.T) {
+	got := servicesLine(debugger.ServicesSummary{Names: []string{"postgres", "redis"}})
+	if !strings.Contains(got, "2 service container(s)") || !strings.Contains(got, "postgres, redis") {
+		t.Errorf("services line wrong: %q", got)
+	}
+	if got := servicesLine(debugger.ServicesSummary{}); got != "" {
+		t.Errorf("no services should render nothing, got %q", got)
+	}
+}
+
 // TestGCPLines locks the identity transparency: the federation target vs the local
 // identity, what was injected, and the honest no-credentials case.
 func TestGCPLines(t *testing.T) {

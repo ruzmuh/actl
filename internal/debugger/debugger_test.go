@@ -268,6 +268,118 @@ func TestSelectJob(t *testing.T) {
 	}
 }
 
+// planRun parses an inline workflow and returns the single planned run for jobID,
+// without touching Docker — so the pure selection/summary helpers can be unit-tested.
+func planRun(t *testing.T, wf, jobID string) *model.Run {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "wf.yml")
+	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	planner, err := model.NewWorkflowPlanner(path, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planner.PlanEvent("push")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range plan.Stages {
+		for _, r := range st.Runs {
+			if r.JobID == jobID {
+				return r
+			}
+		}
+	}
+	t.Fatalf("job %q not planned", jobID)
+	return nil
+}
+
+const matrixWorkflow = `name: m
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.21', '1.22']
+    steps:
+      - run: echo hi
+`
+
+// TestSelectMatrix covers the four selection outcomes: no matrix (selection moot),
+// a full pin to one combo, an under-specified selection (MultipleMatrixError), and a
+// selection matching nothing (plain error).
+func TestSelectMatrix(t *testing.T) {
+	// (a) matrix-less job: any selection is irrelevant, returned untouched.
+	noMatrix := planRun(t, "name: n\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo a\n", "a")
+	sel := map[string]map[string]bool{"os": {"ubuntu-latest": true}}
+	got, err := selectMatrix(noMatrix, sel)
+	if err != nil {
+		t.Fatalf("no-matrix: %v", err)
+	}
+	if len(got) != 1 { // returned as-is (act ignores it on a matrix-less job)
+		t.Errorf("no-matrix: got %v, want the selection unchanged", got)
+	}
+
+	run := planRun(t, matrixWorkflow, "build") // 4 combinations
+
+	// (b) full pin -> the same selection, ready for Config.Matrix.
+	pin := map[string]map[string]bool{"os": {"ubuntu-latest": true}, "go": {"1.21": true}}
+	if _, err := selectMatrix(run, pin); err != nil {
+		t.Errorf("full pin: %v", err)
+	}
+
+	// (c) under-specified (one of two keys) -> MultipleMatrixError with the candidates.
+	under := map[string]map[string]bool{"os": {"ubuntu-latest": true}}
+	_, err = selectMatrix(run, under)
+	var multi *MultipleMatrixError
+	if !errors.As(err, &multi) {
+		t.Fatalf("under-specified: want MultipleMatrixError, got %v", err)
+	}
+	if multi.Job != "build" || len(multi.Combos) != 2 {
+		t.Errorf("MultipleMatrixError = %+v, want job=build with 2 combos", multi)
+	}
+	if multi.Combos[0] != "go=1.21, os=ubuntu-latest" {
+		t.Errorf("combo label = %q, want sorted 'go=…, os=…'", multi.Combos[0])
+	}
+
+	// (d) no combination matches -> plain error, not MultipleMatrixError.
+	none := map[string]map[string]bool{"os": {"windows-latest": true}}
+	_, err = selectMatrix(run, none)
+	if err == nil || errors.As(err, &multi) {
+		t.Errorf("no-match: want a plain error, got %v", err)
+	}
+}
+
+// TestBuildServices checks the services summary lists names sorted, and is empty when
+// the job declares no services.
+func TestBuildServices(t *testing.T) {
+	const wf = `name: s
+on: push
+jobs:
+  it:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+      postgres:
+        image: postgres:16
+    steps:
+      - run: echo hi
+`
+	got := buildServices(planRun(t, wf, "it").Job())
+	if len(got.Names) != 2 || got.Names[0] != "postgres" || got.Names[1] != "redis" {
+		t.Errorf("buildServices = %v, want sorted [postgres redis]", got.Names)
+	}
+
+	none := buildServices(planRun(t, "name: n\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo a\n", "a").Job())
+	if len(none.Names) != 0 {
+		t.Errorf("no services: got %v, want empty", none.Names)
+	}
+}
+
 // TestIsolatedPlan guards against re-executing the whole dependency graph: the
 // session must run only the selected job's run, even when it has needs.
 func TestIsolatedPlan(t *testing.T) {

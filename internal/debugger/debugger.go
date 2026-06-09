@@ -73,6 +73,20 @@ func (e *MultipleJobsError) Error() string {
 	return fmt.Sprintf("workflow has %d jobs; select one with -job: %s", len(e.Jobs), strings.Join(e.Jobs, ", "))
 }
 
+// MultipleMatrixError is returned by New when the selected job is a matrix job and
+// the supplied -matrix selection does not pin it to a single combination (debugging
+// one job means debugging one combination). It lists the candidates that remain so a
+// frontend can prompt; the same shape as MultipleJobsError.
+type MultipleMatrixError struct {
+	Job    string
+	Combos []string // candidate combinations as "k=v, k2=v2" labels, sorted
+}
+
+func (e *MultipleMatrixError) Error() string {
+	return fmt.Sprintf("job %q has %d matrix combinations; narrow to one with -matrix KEY=VALUE: %s",
+		e.Job, len(e.Combos), strings.Join(e.Combos, " | "))
+}
+
 // NeedsInput seeds an upstream job's contribution to the needs context when a
 // downstream job is debugged in isolation (the upstream job is not run). Outputs
 // holds only the keys the user provided; Result defaults to "success" if empty.
@@ -175,6 +189,13 @@ type GCPSummary struct {
 	Token   bool     // an access token was injected
 }
 
+// ServicesSummary lists the names of the job's `services:` containers, for a
+// transparency line. act starts these natively when the job runs; actl only surfaces
+// that they will start. Empty when the job declares no services.
+type ServicesSummary struct {
+	Names []string // service container names (sorted)
+}
+
 // AWSSummary is a redacted view of the AWS identity substitution for a transparency
 // line, the AWS analog of GCPSummary: which auth steps were intercepted, the role +
 // region each would have federated as in real CI, and the local identity we run as.
@@ -193,21 +214,22 @@ const gcpCredsContainerPath = "/actl/gcp/adc.json"
 
 // Options configures a debug Session. Only WorkflowPath is required.
 type Options struct {
-	WorkflowPath string                // path to the workflow file
-	EventName    string                // event to plan for (default "push")
-	JobID        string                // which job to debug; required only if the event plans more than one
-	WithDeps     bool                  // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
-	Image        string                // docker image mapped to ubuntu-latest (default catthehacker)
-	Workdir      string                // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
-	Source       string                // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
-	Secrets      map[string]string     // secrets.* exposed to the workflow
-	Vars         map[string]string     // vars.* exposed to the workflow
-	Env          map[string]string     // extra env for containers
-	GCP          *GCPIdentity          // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
-	AWS          *AWSIdentity          // ambient AWS creds to substitute for a federated aws-actions/configure-aws-credentials (nil = leave auth steps untouched)
-	Needs        map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
-	BreakOnError bool                  // in Continue mode, halt after a step that errored
-	Breakpoints  []int                 // zero-based step indices to halt before, in Continue mode
+	WorkflowPath string                     // path to the workflow file
+	EventName    string                     // event to plan for (default "push")
+	JobID        string                     // which job to debug; required only if the event plans more than one
+	Matrix       map[string]map[string]bool // matrix combination to pin (act's Config.Matrix shape: key→value→true); required only if the job's matrix has more than one combination
+	WithDeps     bool                       // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
+	Image        string                     // docker image mapped to ubuntu-latest (default catthehacker)
+	Workdir      string                     // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
+	Source       string                     // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
+	Secrets      map[string]string          // secrets.* exposed to the workflow
+	Vars         map[string]string          // vars.* exposed to the workflow
+	Env          map[string]string          // extra env for containers
+	GCP          *GCPIdentity               // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
+	AWS          *AWSIdentity               // ambient AWS creds to substitute for a federated aws-actions/configure-aws-credentials (nil = leave auth steps untouched)
+	Needs        map[string]NeedsInput      // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
+	BreakOnError bool                       // in Continue mode, halt after a step that errored
+	Breakpoints  []int                      // zero-based step indices to halt before, in Continue mode
 
 	// Runtime context GitHub injects in real CI that a clean local runner lacks
 	// — all seed-and-be-honest surfaces (CLAUDE.md §4), each with a transparency line.
@@ -259,26 +281,27 @@ type control struct {
 
 // Session is one debug run of a single job. Construct with New, then Start.
 type Session struct {
-	jobID          string
-	steps          []*model.Step
-	needs          []NeedsSummary       // how the selected job's needs were satisfied locally (for transparency)
-	withDeps       bool                 // upstream needs run for real before the target job
-	isolatedWS     bool                 // workspace is an empty temp dir (no user repo) → local actions won't resolve
-	workspace      string               // the bind-mounted workspace path (empty unless -workdir given)
-	interceptors   []stepInterceptor    // neutralize-and-substitute hooks (checkout, cloud-auth), driven by the barrier
-	checkoutLabels []string             // intercepted default-checkout labels, for transparency
-	checkoutSource string               // host tree copied into the workspace at checkout (empty unless copy mode)
-	configSummary  ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
-	gcpSummary     GCPSummary           // redacted view of the GCP identity substitution (for transparency)
-	awsSummary     AWSSummary           // redacted view of the AWS identity substitution (for transparency)
-	tokenSummary   TokenSummary         // how github.token was satisfied (for transparency)
-	inputsSummary  InputsSummary        // declared/supplied workflow inputs (for transparency)
-	eventSummary   EventSummary         // the github.event payload backing the run (for transparency)
-	ghcSummary     GitHubContextSummary // resolved github.* runtime context (for transparency)
-	runner         runner.Runner
-	plan           *model.Plan
-	tmpDir         string // non-empty if we created (and must clean up) the workdir
-	eventFile      string // non-empty if we wrote (and must clean up) a merged event.json
+	jobID           string
+	steps           []*model.Step
+	needs           []NeedsSummary       // how the selected job's needs were satisfied locally (for transparency)
+	withDeps        bool                 // upstream needs run for real before the target job
+	isolatedWS      bool                 // workspace is an empty temp dir (no user repo) → local actions won't resolve
+	workspace       string               // the bind-mounted workspace path (empty unless -workdir given)
+	interceptors    []stepInterceptor    // neutralize-and-substitute hooks (checkout, cloud-auth), driven by the barrier
+	checkoutLabels  []string             // intercepted default-checkout labels, for transparency
+	checkoutSource  string               // host tree copied into the workspace at checkout (empty unless copy mode)
+	configSummary   ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
+	servicesSummary ServicesSummary      // names of the job's `services:` containers (for transparency)
+	gcpSummary      GCPSummary           // redacted view of the GCP identity substitution (for transparency)
+	awsSummary      AWSSummary           // redacted view of the AWS identity substitution (for transparency)
+	tokenSummary    TokenSummary         // how github.token was satisfied (for transparency)
+	inputsSummary   InputsSummary        // declared/supplied workflow inputs (for transparency)
+	eventSummary    EventSummary         // the github.event payload backing the run (for transparency)
+	ghcSummary      GitHubContextSummary // resolved github.* runtime context (for transparency)
+	runner          runner.Runner
+	plan            *model.Plan
+	tmpDir          string // non-empty if we created (and must clean up) the workdir
+	eventFile       string // non-empty if we wrote (and must clean up) a merged event.json
 
 	pauses  chan PauseEvent
 	resume  chan control
@@ -324,6 +347,16 @@ func New(opts Options) (*Session, error) {
 		return nil, fmt.Errorf("debugger: plan event %q: %w", opts.EventName, err)
 	}
 	run, err := selectRun(plan, opts.JobID)
+	if err != nil {
+		return nil, err
+	}
+
+	// A matrix job expands into one run per combination at act's run time, but a
+	// single-job debugger debugs one combination — so pin Config.Matrix to exactly
+	// one. This is a selection problem like -job: if the supplied -matrix doesn't
+	// narrow to one combo, return a MultipleMatrixError listing the candidates. Joins
+	// the pure-invocation errors above (no daemon needed to pick a combo).
+	matrix, err := selectMatrix(run, opts.Matrix)
 	if err != nil {
 		return nil, err
 	}
@@ -459,32 +492,33 @@ func New(opts Options) (*Session, error) {
 	}
 
 	s := &Session{
-		jobID:          run.JobID,
-		steps:          steps,
-		needs:          needs,
-		withDeps:       opts.WithDeps,
-		isolatedWS:     tmpDir != "", // we created an empty temp workspace (no user repo)
-		workspace:      bindWS,
-		interceptors:   interceptors,
-		checkoutLabels: stepLabelsOf(steps, checkouts),
-		checkoutSource: checkoutSource,
-		configSummary:  summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
-		gcpSummary:     gcpSummary,
-		awsSummary:     awsSummary,
-		tokenSummary:   tokenSummary,
-		inputsSummary:  inputsSummary,
-		eventSummary:   eventSummary,
-		ghcSummary:     ghcSummary,
-		plan:           execPlan,
-		tmpDir:         tmpDir,
-		eventFile:      eventFile,
-		pauses:         make(chan PauseEvent),
-		resume:         make(chan control),
-		logs:           make(chan string, 1024),
-		done:           make(chan struct{}),
-		curMode:        modeStep, // stop at entry (before the first step)
-		breakpoints:    breakpoints,
-		breakOnErr:     opts.BreakOnError,
+		jobID:           run.JobID,
+		steps:           steps,
+		needs:           needs,
+		withDeps:        opts.WithDeps,
+		isolatedWS:      tmpDir != "", // we created an empty temp workspace (no user repo)
+		workspace:       bindWS,
+		interceptors:    interceptors,
+		checkoutLabels:  stepLabelsOf(steps, checkouts),
+		checkoutSource:  checkoutSource,
+		configSummary:   summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
+		servicesSummary: buildServices(run.Job()),
+		gcpSummary:      gcpSummary,
+		awsSummary:      awsSummary,
+		tokenSummary:    tokenSummary,
+		inputsSummary:   inputsSummary,
+		eventSummary:    eventSummary,
+		ghcSummary:      ghcSummary,
+		plan:            execPlan,
+		tmpDir:          tmpDir,
+		eventFile:       eventFile,
+		pauses:          make(chan PauseEvent),
+		resume:          make(chan control),
+		logs:            make(chan string, 1024),
+		done:            make(chan struct{}),
+		curMode:         modeStep, // stop at entry (before the first step)
+		breakpoints:     breakpoints,
+		breakOnErr:      opts.BreakOnError,
 	}
 	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done, drop: isGitContextNoise}}
 
@@ -501,6 +535,7 @@ func New(opts Options) (*Session, error) {
 		Env:        mergeEnv(orEmpty(opts.Env), ghcEnv), // github.* overrides (GITHUB_REPOSITORY/GITHUB_REF/SHA_REF) layered onto -env
 		Secrets:    secrets,
 		Vars:       orEmpty(opts.Vars),
+		Matrix:     matrix, // pinned to one combination by selectMatrix (nil for a matrix-less job)
 		// A user-supplied workdir is bind-mounted: act's copy mode leaves the
 		// workspace volume empty (it never populates it), so local `uses: ./…`
 		// actions only resolve when the dir is mounted. The empty-workdir default
@@ -570,6 +605,10 @@ func (s *Session) CheckoutSource() string { return s.checkoutSource }
 // ConfigSummary returns the redacted names of the secrets/vars/env supplied to
 // the run (values withheld), for a transparency line.
 func (s *Session) ConfigSummary() ConfigSummary { return s.configSummary }
+
+// ServicesSummary returns the names of the job's `services:` containers (which act
+// starts natively when the job runs), for a transparency line. Empty when none.
+func (s *Session) ServicesSummary() ServicesSummary { return s.servicesSummary }
 
 // GCPSummary returns the redacted view of the GCP identity substitution (which
 // auth steps were intercepted, the federation target vs the local identity), for a
@@ -1151,6 +1190,88 @@ func jobIDsOf(runs []*model.Run) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// selectMatrix narrows the job's matrix to the single combination to debug. The job
+// expands into one act run per combination at run time; debugging one job means
+// debugging one combination, so we must pin Config.Matrix to exactly one. With no
+// matrix (one implicit combination) the selection is irrelevant and returned as-is —
+// act ignores a stray -matrix on a matrix-less job, matching upstream. Otherwise sel
+// must filter the cross product down to exactly one combo, else an error: a
+// MultipleMatrixError (under-specified) or a plain error (no combination matches).
+func selectMatrix(run *model.Run, sel map[string]map[string]bool) (map[string]map[string]bool, error) {
+	combos, err := run.Job().GetMatrixes() // cross product with includes/excludes applied
+	if err != nil {
+		return nil, fmt.Errorf("debugger: matrix: %w", err)
+	}
+	if len(combos) <= 1 {
+		return sel, nil // no matrix (or a single combination) — nothing to pick
+	}
+	matched := make([]map[string]interface{}, 0, len(combos))
+	for _, c := range combos {
+		if matchMatrix(c, sel) {
+			matched = append(matched, c)
+		}
+	}
+	switch len(matched) {
+	case 1:
+		return sel, nil
+	case 0:
+		return nil, fmt.Errorf("debugger: no matrix combination matches -matrix; the job's combinations are: %s",
+			strings.Join(comboLabels(combos), " | "))
+	default:
+		return nil, &MultipleMatrixError{Job: run.JobID, Combos: comboLabels(matched)}
+	}
+}
+
+// matchMatrix reports whether a combination satisfies the selection. For each key the
+// user constrained, the combination's value (stringified the same way act compares in
+// selectMatrixes) must be in the allowed set; keys the user didn't mention are free.
+func matchMatrix(combo map[string]interface{}, sel map[string]map[string]bool) bool {
+	for key, allowed := range sel {
+		v, ok := combo[key]
+		if !ok {
+			return false
+		}
+		if !allowed[fmt.Sprintf("%v", v)] {
+			return false
+		}
+	}
+	return true
+}
+
+// comboLabels renders matrix combinations as sorted "k=v, k2=v2" strings for listing
+// in a prompt/error.
+func comboLabels(combos []map[string]interface{}) []string {
+	labels := make([]string, 0, len(combos))
+	for _, c := range combos {
+		keys := make([]string, 0, len(c))
+		for k := range c {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, c[k]))
+		}
+		labels = append(labels, strings.Join(parts, ", "))
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+// buildServices lists the names of the job's `services:` containers for a transparency
+// line. act starts them natively when the job runs; we only surface that they will.
+func buildServices(job *model.Job) ServicesSummary {
+	if len(job.Services) == 0 {
+		return ServicesSummary{}
+	}
+	names := make([]string, 0, len(job.Services))
+	for name := range job.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return ServicesSummary{Names: names}
 }
 
 // liveNeeds lists the selected job's needs for a transparency line in --with-deps
