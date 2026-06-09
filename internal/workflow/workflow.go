@@ -11,6 +11,7 @@ import (
 	"sort"
 
 	"github.com/nektos/act/pkg/model"
+	"gopkg.in/yaml.v3"
 )
 
 // Discover returns the workflow files under dir/.github/workflows, sorted. It
@@ -57,6 +58,53 @@ func Load(path string, strict bool) (*model.Workflow, error) {
 	}
 	wf.File = path
 	return wf, nil
+}
+
+// JobEnvironment returns the deployment environment a job targets (GHA's job-level
+// `environment:` key), or "" when the job declares none. act's model drops this field
+// entirely (model.Job has only `env:`, the env-var map — not the deployment
+// environment), so actl reads it straight from the raw YAML. GHA allows two forms:
+// a bare string (`environment: production`) or an object (`environment: {name: …}`);
+// both yield the name. A missing job/file/key is "" with no error — the caller treats
+// "no environment" the same whether the job lacks one or the file can't be read here
+// (a real parse error surfaces in debugger.New).
+func JobEnvironment(path, jobID string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open workflow: %w", err)
+	}
+	defer f.Close()
+
+	var doc struct {
+		Jobs map[string]struct {
+			Environment yaml.Node `yaml:"environment"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.NewDecoder(f).Decode(&doc); err != nil {
+		return "", fmt.Errorf("parse workflow %q: %w", path, err)
+	}
+	job, ok := doc.Jobs[jobID]
+	if !ok {
+		return "", nil
+	}
+	switch job.Environment.Kind {
+	case yaml.ScalarNode:
+		var name string
+		if err := job.Environment.Decode(&name); err != nil {
+			return "", nil
+		}
+		return name, nil
+	case yaml.MappingNode:
+		var obj struct {
+			Name string `yaml:"name"`
+		}
+		if err := job.Environment.Decode(&obj); err != nil {
+			return "", nil
+		}
+		return obj.Name, nil
+	default:
+		return "", nil // absent (zero node) or an unexpected shape
+	}
 }
 
 // StepKind is a human-facing label for how a step will execute. It collapses

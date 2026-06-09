@@ -1,0 +1,20 @@
+name: env-test
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy
+        run: echo deploying
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.com
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    steps:
+      - name: Build
+        run: echo building ${{ matrix.os }}

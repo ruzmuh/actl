@@ -28,6 +28,8 @@ import (
 	"github.com/nektos/act/pkg/container"
 	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
+
+	"github.com/ruzmuh/actl/internal/workflow"
 )
 
 // ErrAborted is the run error when the front-end aborts via Abort.
@@ -209,27 +211,53 @@ type AWSSummary struct {
 	RegionSet bool     // AWS_REGION/AWS_DEFAULT_REGION were injected from the declared region
 }
 
+// EnvSummary describes the per-`environment:` overlay applied for the debugged job, for
+// a transparency line: the environment the job targets and how many secrets/vars its
+// overlay contributed. Name is empty when the job targets no environment; Name set with
+// zero counts means the job targets an environment for which no overlay was configured
+// (the flat defaults are used as-is). Values are never retained here.
+type EnvSummary struct {
+	Name    string // the job's `environment:` (deployment environment), "" if none
+	Secrets int    // overlay secret keys merged in
+	Vars    int    // overlay var keys merged in
+}
+
 // container path the ambient ADC file is mounted at (matches the env we inject).
 const gcpCredsContainerPath = "/actl/gcp/adc.json"
 
+// EnvOverlay is a per-`environment:` overlay of secrets/vars applied when the debugged
+// job targets that deployment environment (GHA scopes secrets/vars by `environment:`).
+// The host (cmd/actl) resolves each environment's secret-file/inline-vars into these
+// flat maps; the core merges the matching one over the flat defaults (CLI overrides
+// still win — see New).
+type EnvOverlay struct {
+	Secrets map[string]string
+	Vars    map[string]string
+}
+
 // Options configures a debug Session. Only WorkflowPath is required.
 type Options struct {
-	WorkflowPath string                     // path to the workflow file
-	EventName    string                     // event to plan for (default "push")
-	JobID        string                     // which job to debug; required only if the event plans more than one
-	Matrix       map[string]map[string]bool // matrix combination to pin (act's Config.Matrix shape: key→value→true); required only if the job's matrix has more than one combination
-	WithDeps     bool                       // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
-	Image        string                     // docker image mapped to ubuntu-latest (default catthehacker)
-	Workdir      string                     // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
-	Source       string                     // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
-	Secrets      map[string]string          // secrets.* exposed to the workflow
-	Vars         map[string]string          // vars.* exposed to the workflow
-	Env          map[string]string          // extra env for containers
-	GCP          *GCPIdentity               // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
-	AWS          *AWSIdentity               // ambient AWS creds to substitute for a federated aws-actions/configure-aws-credentials (nil = leave auth steps untouched)
-	Needs        map[string]NeedsInput      // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
-	BreakOnError bool                       // in Continue mode, halt after a step that errored
-	Breakpoints  []int                      // zero-based step indices to halt before, in Continue mode
+	WorkflowPath    string                     // path to the workflow file
+	EventName       string                     // event to plan for (default "push")
+	JobID           string                     // which job to debug; required only if the event plans more than one
+	Matrix          map[string]map[string]bool // matrix combination to pin (act's Config.Matrix shape: key→value→true); required only if the job's matrix has more than one combination
+	WithDeps        bool                       // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
+	Image           string                     // docker image mapped to ubuntu-latest when Images is empty (default catthehacker); back-compat sugar for Images
+	Images          map[string]string          // runner label → docker image (act's -P/Platforms map); empty falls back to {ubuntu-latest: Image}
+	Workdir         string                     // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
+	Source          string                     // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
+	Secrets         map[string]string          // secrets.* base (flat defaults, e.g. from secret-file); the env overlay and SecretOverrides layer on top
+	Vars            map[string]string          // vars.* base (flat defaults); the env overlay and VarOverrides layer on top
+	Env             map[string]string          // extra env for containers
+	Environments    map[string]EnvOverlay      // per-`environment:` secrets/vars overlays, keyed by environment name; the one matching the debugged job's `environment:` is merged over Secrets/Vars
+	SecretOverrides map[string]string          // secrets.* applied last (after the env overlay) so an explicit CLI -secret wins; nil for library callers
+	VarOverrides    map[string]string          // vars.* applied last (after the env overlay) so an explicit CLI -var wins; nil for library callers
+	GCP             *GCPIdentity               // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
+	AWS             *AWSIdentity               // ambient AWS creds to substitute for a federated aws-actions/configure-aws-credentials (nil = leave auth steps untouched)
+	Needs           map[string]NeedsInput      // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
+	BreakOnError    bool                       // in Continue mode, halt after a step that errored
+	Breakpoints     []int                      // zero-based step indices to halt before, in Continue mode
+	BreakpointNames []string                   // step names to halt before, resolved to indices against the job's steps in New (a name with no matching step is an error)
 
 	// Runtime context GitHub injects in real CI that a clean local runner lacks
 	// — all seed-and-be-honest surfaces (CLAUDE.md §4), each with a transparency line.
@@ -291,6 +319,7 @@ type Session struct {
 	checkoutLabels  []string             // intercepted default-checkout labels, for transparency
 	checkoutSource  string               // host tree copied into the workspace at checkout (empty unless copy mode)
 	configSummary   ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
+	envSummary      EnvSummary           // per-`environment:` overlay applied for the job (for transparency)
 	servicesSummary ServicesSummary      // names of the job's `services:` containers (for transparency)
 	gcpSummary      GCPSummary           // redacted view of the GCP identity substitution (for transparency)
 	awsSummary      AWSSummary           // redacted view of the AWS identity substitution (for transparency)
@@ -328,23 +357,13 @@ type Session struct {
 // plans more than one, Options.JobID must pick one (else a MultipleJobsError
 // lists the choices).
 func New(opts Options) (*Session, error) {
-	if opts.WorkflowPath == "" {
-		return nil, errors.New("debugger: WorkflowPath is required")
-	}
-	if opts.EventName == "" {
-		opts.EventName = "push"
-	}
 	if opts.Image == "" {
 		opts.Image = "catthehacker/ubuntu:act-latest"
 	}
 
-	planner, err := model.NewWorkflowPlanner(opts.WorkflowPath, true, false)
+	plan, err := parsePlan(&opts)
 	if err != nil {
-		return nil, fmt.Errorf("debugger: planner: %w", err)
-	}
-	plan, err := planner.PlanEvent(opts.EventName)
-	if err != nil {
-		return nil, fmt.Errorf("debugger: plan event %q: %w", opts.EventName, err)
+		return nil, err
 	}
 	run, err := selectRun(plan, opts.JobID)
 	if err != nil {
@@ -390,6 +409,15 @@ func New(opts Options) (*Session, error) {
 
 	steps := run.Job().Steps
 
+	// Resolve config breakpoint names (e.g. `breakpoints: ["Run tests"]`) to step
+	// indices now, against the original steps and before any interceptor rewrites a
+	// label — an unknown name is a usage error listing the available step names. Done
+	// before the workspace temp dir exists, so there's nothing to clean up on error.
+	breakIdx, err := resolveBreakpoints(steps, opts.Breakpoints, opts.BreakpointNames)
+	if err != nil {
+		return nil, err
+	}
+
 	// Step interceptors neutralize step classes that can't run faithfully on a
 	// local runner — rewriting them to no-ops and substituting the real local effect
 	// at the step's position (see barrier). Each is built once here; the barrier and
@@ -418,10 +446,29 @@ func New(opts Options) (*Session, error) {
 	// injects them — and the step's declared aws-region — at its position.
 	awsItc, awsSummary := buildAWSInterceptor(opts.AWS, steps)
 
+	// Per-`environment:` secrets/vars overlay (CLAUDE.md §4 multi-env). The job may
+	// target a deployment environment (e.g. `environment: production`) whose secrets/
+	// vars differ from the flat defaults; GHA scopes them by environment and act knows
+	// nothing of that, so we resolve the overlay ourselves. Layer flat defaults ← the
+	// matching overlay ← CLI overrides, so an explicit -secret/-var still wins. act's
+	// model drops the `environment:` key, so read it straight from the raw YAML.
+	envName, _ := workflow.JobEnvironment(opts.WorkflowPath, run.JobID)
+	overlay := opts.Environments[envName]
+	secrets := layer(opts.Secrets, overlay.Secrets, opts.SecretOverrides)
+	vars := layer(opts.Vars, overlay.Vars, opts.VarOverrides)
+	envSummary := EnvSummary{Name: envName}
+	if envName != "" {
+		envSummary.Secrets, envSummary.Vars = len(overlay.Secrets), len(overlay.Vars)
+	}
+
+	// Redacted transparency summary of the effective secrets/vars/env — taken before
+	// resolveToken mirrors github.token into secrets, so the token isn't double-counted
+	// here (it has its own TokenSummary).
+	configSummary := summarizeConfig(secrets, vars, opts.Env)
+
 	// Runtime context GitHub injects that a clean local runner lacks (CLAUDE.md §4):
 	// GITHUB_TOKEN, workflow inputs, the event payload, and the github.* context.
 	// Each is seeded here and reported via a transparency line; none needs a fork patch.
-	secrets := orEmpty(opts.Secrets)
 	token, tokenSummary := resolveToken(opts.GitHubToken, secrets) // also mirrors token into secrets.GITHUB_TOKEN
 	eventPath, eventFile, eventSummary, err := buildEvent(opts)
 	if err != nil {
@@ -486,11 +533,6 @@ func New(opts Options) (*Session, error) {
 		interceptors = append(interceptors, awsItc)
 	}
 
-	breakpoints := make(map[int]bool, len(opts.Breakpoints))
-	for _, i := range opts.Breakpoints {
-		breakpoints[i] = true
-	}
-
 	s := &Session{
 		jobID:           run.JobID,
 		steps:           steps,
@@ -501,7 +543,8 @@ func New(opts Options) (*Session, error) {
 		interceptors:    interceptors,
 		checkoutLabels:  stepLabelsOf(steps, checkouts),
 		checkoutSource:  checkoutSource,
-		configSummary:   summarizeConfig(opts.Secrets, opts.Vars, opts.Env),
+		configSummary:   configSummary,
+		envSummary:      envSummary,
 		servicesSummary: buildServices(run.Job()),
 		gcpSummary:      gcpSummary,
 		awsSummary:      awsSummary,
@@ -517,7 +560,7 @@ func New(opts Options) (*Session, error) {
 		logs:            make(chan string, 1024),
 		done:            make(chan struct{}),
 		curMode:         modeStep, // stop at entry (before the first step)
-		breakpoints:     breakpoints,
+		breakpoints:     breakIdx,
 		breakOnErr:      opts.BreakOnError,
 	}
 	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done, drop: isGitContextNoise}}
@@ -529,12 +572,12 @@ func New(opts Options) (*Session, error) {
 		Inputs:     orEmpty(opts.Inputs), // ignored by act when EventPath is set; harmless otherwise
 		Token:      token,                // github.token (mirrored into secrets.GITHUB_TOKEN above)
 		Actor:      opts.Actor,           // github.actor ("" → act's "nektos/act" placeholder)
-		Platforms:  map[string]string{"ubuntu-latest": opts.Image},
+		Platforms:  buildPlatforms(opts),
 		AutoRemove: true,
 		LogOutput:  true,                                // route step stdout through the logger (captured below)
 		Env:        mergeEnv(orEmpty(opts.Env), ghcEnv), // github.* overrides (GITHUB_REPOSITORY/GITHUB_REF/SHA_REF) layered onto -env
 		Secrets:    secrets,
-		Vars:       orEmpty(opts.Vars),
+		Vars:       vars,
 		Matrix:     matrix, // pinned to one combination by selectMatrix (nil for a matrix-less job)
 		// A user-supplied workdir is bind-mounted: act's copy mode leaves the
 		// workspace volume empty (it never populates it), so local `uses: ./…`
@@ -605,6 +648,11 @@ func (s *Session) CheckoutSource() string { return s.checkoutSource }
 // ConfigSummary returns the redacted names of the secrets/vars/env supplied to
 // the run (values withheld), for a transparency line.
 func (s *Session) ConfigSummary() ConfigSummary { return s.configSummary }
+
+// EnvSummary returns the per-`environment:` overlay applied for the debugged job (the
+// environment it targets and how many secrets/vars its overlay contributed), for a
+// transparency line. Its Name is empty when the job targets no environment.
+func (s *Session) EnvSummary() EnvSummary { return s.envSummary }
 
 // ServicesSummary returns the names of the job's `services:` containers (which act
 // starts natively when the job runs), for a transparency line. Empty when none.
@@ -1158,6 +1206,85 @@ func (s *Session) cleanup() {
 	}
 }
 
+// parsePlan parses the workflow and plans the chosen event — the Docker-free prefix
+// shared by New (which then preflights Docker and builds a Session) and List (which
+// stops here). It defaults EventName and validates WorkflowPath, mutating opts so both
+// callers see the same normalized values.
+func parsePlan(opts *Options) (*model.Plan, error) {
+	if opts.WorkflowPath == "" {
+		return nil, errors.New("debugger: WorkflowPath is required")
+	}
+	if opts.EventName == "" {
+		opts.EventName = "push"
+	}
+	planner, err := model.NewWorkflowPlanner(opts.WorkflowPath, true, false)
+	if err != nil {
+		return nil, fmt.Errorf("debugger: planner: %w", err)
+	}
+	plan, err := planner.PlanEvent(opts.EventName)
+	if err != nil {
+		return nil, fmt.Errorf("debugger: plan event %q: %w", opts.EventName, err)
+	}
+	return plan, nil
+}
+
+// buildPlatforms assembles act's runner-label → image map (its -P/Platforms). The
+// common ubuntu labels default to opts.Image (so an unmapped `runs-on: ubuntu-22.04`
+// still resolves to a sane image rather than act's bare node:16), and opts.Images
+// overrides per label (keys lowercased, as act compares them). With no Images set this
+// reduces to the historical {ubuntu-latest: Image} behavior plus the extra defaults.
+func buildPlatforms(opts Options) map[string]string {
+	out := map[string]string{}
+	for _, label := range []string{"ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04"} {
+		out[label] = opts.Image
+	}
+	for label, image := range opts.Images {
+		out[strings.ToLower(label)] = image
+	}
+	return out
+}
+
+// layer merges maps left-to-right (later wins) into a fresh, non-nil map — used to
+// stack secrets/vars as flat defaults ← env overlay ← CLI overrides.
+func layer(maps ...map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, m := range maps {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// resolveBreakpoints builds the halt-before index set from explicit indices plus step
+// names resolved against the job's steps. A name matches a step's `name:` or its display
+// label (Step.String(), covering unnamed `uses:`/`run:` steps); an unknown name is an
+// error listing the available step labels so the user can correct the config.
+func resolveBreakpoints(steps []*model.Step, indices []int, names []string) (map[int]bool, error) {
+	out := make(map[int]bool, len(indices)+len(names))
+	for _, i := range indices {
+		out[i] = true
+	}
+	for _, name := range names {
+		idx := -1
+		for i, st := range steps {
+			if st.Name == name || st.String() == name {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			labels := make([]string, len(steps))
+			for i, st := range steps {
+				labels[i] = st.String()
+			}
+			return nil, fmt.Errorf("debugger: breakpoint step %q not found; steps are: %s", name, strings.Join(labels, " | "))
+		}
+		out[idx] = true
+	}
+	return out, nil
+}
+
 // selectRun picks the single job to debug. With jobID set it returns that job
 // (or an error naming the available ones); without it, it returns the sole job,
 // or a MultipleJobsError so a frontend can prompt.
@@ -1533,4 +1660,60 @@ func mergeEnv(base, add map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// Listing is a Docker-free inventory of a workflow's jobs and steps, produced by List
+// for `actl -list` so the user can see what they'd debug (jobs, their environment and
+// matrix combinations, and each job's steps) without starting a container.
+type Listing struct {
+	WorkflowPath string
+	Event        string
+	Jobs         []JobListing
+}
+
+// JobListing is one job in a Listing.
+type JobListing struct {
+	ID          string
+	Name        string
+	Environment string   // deployment environment (`environment:`), "" if none
+	Matrix      []string // combination labels ("k=v, …") when the job has more than one; nil otherwise
+	Steps       []StepListing
+}
+
+// StepListing is one step in a JobListing.
+type StepListing struct {
+	Index int
+	Label string // step display label (name / uses / run)
+	Kind  string // run / docker / local / remote / reusable
+}
+
+// List parses and plans the workflow and returns its jobs and steps without touching
+// Docker — the read-only counterpart to New, sharing the same parsePlan prefix. It does
+// not select a single job (it lists them all), so a multi-job or matrix workflow is
+// reported in full rather than prompting.
+func List(opts Options) (*Listing, error) {
+	plan, err := parsePlan(&opts)
+	if err != nil {
+		return nil, err
+	}
+	listing := &Listing{WorkflowPath: opts.WorkflowPath, Event: opts.EventName}
+	for _, stage := range plan.Stages {
+		for _, run := range stage.Runs {
+			job := run.Job()
+			jl := JobListing{ID: run.JobID, Name: job.Name}
+			jl.Environment, _ = workflow.JobEnvironment(opts.WorkflowPath, run.JobID)
+			if combos, err := job.GetMatrixes(); err == nil && len(combos) > 1 {
+				jl.Matrix = comboLabels(combos)
+			}
+			for i, st := range job.Steps {
+				jl.Steps = append(jl.Steps, StepListing{
+					Index: i,
+					Label: st.String(),
+					Kind:  string(workflow.KindOf(st)),
+				})
+			}
+			listing.Jobs = append(listing.Jobs, jl)
+		}
+	}
+	return listing, nil
 }

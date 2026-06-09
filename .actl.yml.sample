@@ -1,0 +1,57 @@
+# Sample actl project config. This file is NOT auto-discovered (actl looks for
+# `.actl.yml`); use it explicitly:  actl -config .actl.yml.sample -list
+# To adopt it for a project, copy it to `.actl.yml` (then it's picked up by default).
+# Every key is optional; a CLI flag overrides its value here, which overrides actl's
+# built-in default.
+
+# --- which debug slice ---
+workflow: testdata/workflows/environments.yml  # default workflow (a path arg still wins)
+job: build                                     # which job to debug
+event: push                                    # event to plan for
+matrix:                                         # pin one matrix combination
+  os: ubuntu-latest
+with-deps: false                                # true = run upstream needs for real first
+
+# --- runner images (act's -P: runner label -> docker image) ---
+images:
+  ubuntu-latest: catthehacker/ubuntu:act-latest
+  ubuntu-22.04: catthehacker/ubuntu:act-22.04
+
+# --- breakpoints (step index OR step name) ---
+breakpoints:
+  - 0
+  - "Build"
+
+# --- workspace ---
+# workdir: .          # bind-mount this dir (writable) so local 'uses: ./' resolve
+# source: .           # tree a default actions/checkout copies from
+
+# --- secrets / vars / env ---
+# Secrets are FILE-ONLY here (this file is committable): point at a dotenv file,
+# never inline a `secrets:` map (actl rejects it).
+secret-file: .secrets
+vars:
+  REGION: us-east-1
+env:
+  LOG_LEVEL: debug
+
+# --- per-environment overlays (GHA deployment `environment:`) ---
+# When the debugged job targets one of these, its secrets/vars overlay the flat
+# defaults above (a CLI -secret/-var still wins).
+environments:
+  production:
+    secret-file: .secrets.prod
+    vars:
+      REGION: us-west-2
+  staging:
+    vars:
+      REGION: eu-west-1
+
+# --- runtime context ---
+inputs:
+  version: "1.2.3"
+# needs:                # seed upstream needs for isolated debugging
+#   lint:
+#     result: success
+#     outputs:
+#       sha: abc123

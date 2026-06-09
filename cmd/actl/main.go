@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
 
+	"github.com/ruzmuh/actl/internal/config"
 	"github.com/ruzmuh/actl/internal/debugger"
 	"github.com/ruzmuh/actl/internal/tui"
 	"github.com/ruzmuh/actl/internal/workflow"
@@ -55,12 +56,15 @@ func main() {
 	ref := flag.String("ref", "", "override github.ref, e.g. refs/heads/main (default: derive from the local git HEAD)")
 	sha := flag.String("sha", "", "override github.sha (default: derive from the local git HEAD)")
 	actor := flag.String("actor", "", "override github.actor (default: act's 'nektos/act' placeholder)")
-	var needs, envs, secrets, vars, inputs, matrix stringSlice
+	configPath := flag.String("config", ".actl.yml", "project config file for the debug slice (job/matrix/breakpoints/secrets/vars/env); skipped if absent unless set explicitly")
+	list := flag.Bool("list", false, "list the workflow's jobs and steps (with matrix combinations and environment) without running, then exit")
+	var needs, envs, secrets, vars, inputs, matrix, platforms stringSlice
 	flag.Var(&matrix, "matrix", "pin a matrix combination: 'KEY=VALUE' (repeatable; required only if the job's matrix has more than one combination)")
+	flag.Var(&platforms, "platform", "map a runner label to a docker image: 'LABEL=IMAGE' (repeatable, act's -P; overrides .actl.yml images)")
 	flag.Var(&needs, "need", "seed an upstream needs value: 'JOB.outputs.NAME=VALUE' or 'JOB.result=VALUE' (repeatable)")
 	flag.Var(&envs, "env", "set an env var for the run: 'KEY=VALUE' (repeatable, overrides -env-file)")
-	flag.Var(&secrets, "secret", "set a secret for the run: 'KEY=VALUE' (repeatable, overrides -secret-file)")
-	flag.Var(&vars, "var", "set a var for the run: 'KEY=VALUE' (repeatable, overrides -var-file)")
+	flag.Var(&secrets, "secret", "set a secret for the run: 'KEY=VALUE' (repeatable, overrides -secret-file and any environment overlay)")
+	flag.Var(&vars, "var", "set a var for the run: 'KEY=VALUE' (repeatable, overrides -var-file and any environment overlay)")
 	flag.Var(&inputs, "input", "set a workflow_dispatch/workflow_call input: 'NAME=VALUE' (repeatable)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: actl [flags] [workflow.yml]\n\n")
@@ -68,31 +72,75 @@ func main() {
 	}
 	flag.Parse()
 
-	path, err := resolveWorkflowPath(flag.Arg(0))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "actl:", err)
-		os.Exit(2)
-	}
-
-	needsMap, err := parseNeeds(needs)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "actl:", err)
-		os.Exit(2)
-	}
-
-	// A missing dotenv file is fine when the path is the default; if the user
-	// pointed a flag at a file, a missing/unreadable file is an error (likely a typo).
+	// Which flags the user set explicitly (vs left at their default) — drives the
+	// precedence rule CLI flag > .actl.yml > built-in default, and decides whether a
+	// missing dotenv file is a typo (explicit) or just absent (default).
 	set := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	secretMap, serr := loadConfig(*secretFile, set["secret-file"], secrets)
-	varMap, verr := loadConfig(*varFile, set["var-file"], vars)
-	envMap, eerr := loadConfig(*envFile, set["env-file"], envs)
-	for _, e := range []error{serr, verr, eerr} {
+
+	cfg, err := config.Load(*configPath, set["config"])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "actl:", err)
+		os.Exit(2)
+	}
+	if cfg == nil {
+		cfg = &config.Config{} // no config file → all-empty, so the lookups below fall through to flags
+	}
+
+	path, err := resolveWorkflowPath(flag.Arg(0), cfg.Workflow)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "actl:", err)
+		os.Exit(2)
+	}
+
+	// Scalars: a set flag wins, else the config value, else the flag's default.
+	eventName := orConfig(set["event"], *event, cfg.Event)
+	jobID := orConfig(set["job"], *job, cfg.Job)
+	workdirPath := orConfig(set["workdir"], *workdir, cfg.Workdir)
+	sourceDir := orConfig(set["source"], *source, cfg.Source)
+	secretFilePath := orConfig(set["secret-file"], *secretFile, cfg.SecretFile)
+	withDepsVal := *withDeps
+	if !set["with-deps"] && cfg.WithDeps != nil {
+		withDepsVal = *cfg.WithDeps
+	}
+
+	// -list is a read-only inventory: print jobs/steps without touching Docker or
+	// shelling out for identity, then exit. Done here, before any of that.
+	if *list {
+		listing, err := debugger.List(debugger.Options{WorkflowPath: path, EventName: eventName})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "actl:", err)
+			os.Exit(1)
+		}
+		printListing(listing)
+		return
+	}
+
+	needsMap, err := resolveNeeds(needs, cfg.Needs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "actl:", err)
+		os.Exit(2)
+	}
+
+	// secrets/vars/env precedence (a missing dotenv file is fine unless its path was
+	// given explicitly). Secrets are file-only (.actl.yml can't inline them); vars/env
+	// may also come from the config inline maps, under the dotenv file. CLI -secret/-var
+	// are kept separate as *Overrides so the core can apply them AFTER the per-environment
+	// overlay — an explicit override always wins; -env has no overlay so it folds in here.
+	secretMap, serr := loadConfig(nil, secretFilePath, set["secret-file"] || cfg.SecretFile != "", nil)
+	varMap, verr := loadConfig(cfg.Vars, *varFile, set["var-file"], nil)
+	envMap, eerr := loadConfig(cfg.Env, *envFile, set["env-file"], envs)
+	environments, oerr := resolveEnvironments(cfg.Environments)
+	for _, e := range []error{serr, verr, eerr, oerr} {
 		if e != nil {
 			fmt.Fprintln(os.Stderr, "actl:", e)
 			os.Exit(2)
 		}
 	}
+	secretOverrides := parseKeyVals(secrets)
+	varOverrides := parseKeyVals(vars)
+
+	bpIdx, bpNames := splitBreakpoints(cfg.Breakpoints)
 
 	// Ambient GCP identity: only resolved (and gcloud invoked) when the workflow
 	// actually has a google-github-actions/auth step — kept lazy so non-GCP runs
@@ -109,43 +157,49 @@ func main() {
 		aws = gatherAWSIdentity(path, *awsProfile)
 	}
 
-	// github.token: explicit flag wins; the core falls back to a GITHUB_TOKEN in
-	// .secrets; failing both, try the dev's ambient `gh` login (best-effort, like
-	// gcloud for GCP). The transparency line makes the substitution loud.
+	// github.token: explicit flag wins; the core falls back to a GITHUB_TOKEN in the
+	// secrets (file or -secret); failing both, try the dev's ambient `gh` login
+	// (best-effort, like gcloud for GCP). The transparency line makes it loud.
 	token := *githubToken
-	if token == "" && secretMap["GITHUB_TOKEN"] == "" {
+	if token == "" && secretMap["GITHUB_TOKEN"] == "" && secretOverrides["GITHUB_TOKEN"] == "" {
 		token = ghValue("auth", "token")
 	}
 
 	// github.* runtime context: each flag wins, otherwise derive from the local git
 	// repo (the source tree being debugged) so the transparency line shows real
 	// values; empty leaves it for act to derive.
-	gitDir := firstNonEmpty(*source, *workdir, ".")
+	gitDir := firstNonEmpty(sourceDir, workdirPath, ".")
 	repo, gref, gsha := resolveGitHubContext(gitDir, *repository, *ref, *sha)
 
 	opts := debugger.Options{
-		WorkflowPath: path,
-		EventName:    *event,
-		JobID:        *job,
-		Matrix:       parseMatrixSel(matrix),
-		WithDeps:     *withDeps,
-		Workdir:      *workdir,
-		Source:       *source,
-		Image:        *image,
-		BreakOnError: *breakOnError,
-		Needs:        needsMap,
-		Secrets:      secretMap,
-		Vars:         varMap,
-		Env:          envMap,
-		GCP:          gcp,
-		AWS:          aws,
-		GitHubToken:  token,
-		Inputs:       parseKeyVals(inputs),
-		EventPath:    *eventFile,
-		Repository:   repo,
-		Ref:          gref,
-		Sha:          gsha,
-		Actor:        *actor,
+		WorkflowPath:    path,
+		EventName:       eventName,
+		JobID:           jobID,
+		Matrix:          resolveMatrix(cfg.Matrix, matrix),
+		WithDeps:        withDepsVal,
+		Workdir:         workdirPath,
+		Source:          sourceDir,
+		Image:           *image,
+		Images:          resolveImages(cfg.Images, platforms),
+		BreakOnError:    *breakOnError,
+		Breakpoints:     bpIdx,
+		BreakpointNames: bpNames,
+		Needs:           needsMap,
+		Secrets:         secretMap,
+		Vars:            varMap,
+		Env:             envMap,
+		Environments:    environments,
+		SecretOverrides: secretOverrides,
+		VarOverrides:    varOverrides,
+		GCP:             gcp,
+		AWS:             aws,
+		GitHubToken:     token,
+		Inputs:          mergeStrMap(cfg.Inputs, parseKeyVals(inputs)),
+		EventPath:       *eventFile,
+		Repository:      repo,
+		Ref:             gref,
+		Sha:             gsha,
+		Actor:           *actor,
 	}
 
 	if err := run(opts); err != nil {
@@ -159,9 +213,12 @@ func main() {
 // directory: exactly one is used (with an honest note on stderr); none or several
 // is a friendly error telling the user to pass one explicitly — mirroring how
 // -job handles a multi-job workflow.
-func resolveWorkflowPath(arg string) (string, error) {
+func resolveWorkflowPath(arg, cfgWorkflow string) (string, error) {
 	if arg != "" {
 		return arg, nil
+	}
+	if cfgWorkflow != "" {
+		return cfgWorkflow, nil
 	}
 	found, err := workflow.Discover(".")
 	if err != nil {
@@ -209,11 +266,15 @@ func parseNeeds(entries []string) (map[string]debugger.NeedsInput, error) {
 	return out, nil
 }
 
-// loadConfig reads a dotenv file into a map, then applies KEY=VALUE flag
-// overrides (which win). A missing file is skipped unless explicit, in which case
-// it (and any parse error) is reported. Returns nil when nothing loaded.
-func loadConfig(file string, explicit bool, overrides []string) (map[string]string, error) {
+// loadConfig layers a flat key/value set: a base map (e.g. .actl.yml inline vars/env),
+// then a dotenv file, then KEY=VALUE flag overrides — each winning over the last. A
+// missing file is skipped unless explicit, in which case it (and any parse error) is
+// reported. Returns nil when nothing loaded.
+func loadConfig(base map[string]string, file string, explicit bool, overrides []string) (map[string]string, error) {
 	out := map[string]string{}
+	for k, v := range base {
+		out[k] = v
+	}
 	data, err := godotenv.Read(file)
 	switch {
 	case err == nil:
@@ -230,6 +291,147 @@ func loadConfig(file string, explicit bool, overrides []string) (map[string]stri
 		return nil, nil
 	}
 	return out, nil
+}
+
+// orConfig implements the scalar precedence CLI flag > .actl.yml > default: a flag the
+// user set explicitly wins; otherwise a non-empty config value; otherwise the flag's
+// own (default) value.
+func orConfig(set bool, flagVal, cfgVal string) string {
+	if !set && cfgVal != "" {
+		return cfgVal
+	}
+	return flagVal
+}
+
+// mergeStrMap overlays b onto a (b wins) into a fresh map, or nil when both are empty.
+func mergeStrMap(a, b map[string]string) map[string]string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
+}
+
+// resolveMatrix merges the config matrix (one value per key) under the CLI -matrix flags
+// (act's key→value→true shape); a key given on the CLI replaces the config's value for
+// that key. Returns nil when neither constrains the matrix.
+func resolveMatrix(cfgMatrix map[string]string, cli []string) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for k, v := range cfgMatrix {
+		out[k] = map[string]bool{v: true}
+	}
+	for k, vs := range parseMatrixSel(cli) {
+		out[k] = vs // CLI replaces the config's selection for this key
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// resolveImages builds the runner label → image map from .actl.yml images: under the
+// CLI -platform flags (flag wins). Keys are lowercased to match how act compares labels.
+func resolveImages(cfgImages map[string]string, platforms []string) map[string]string {
+	out := map[string]string{}
+	for k, v := range cfgImages {
+		out[strings.ToLower(k)] = v
+	}
+	for k, v := range parseKeyVals(platforms) {
+		out[strings.ToLower(k)] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// resolveNeeds merges config needs under the CLI -need flags: a job named on the CLI
+// replaces its config seed entirely.
+func resolveNeeds(cli []string, cfgNeeds map[string]config.Need) (map[string]debugger.NeedsInput, error) {
+	cliMap, err := parseNeeds(cli)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfgNeeds) == 0 {
+		return cliMap, nil
+	}
+	out := map[string]debugger.NeedsInput{}
+	for job, n := range cfgNeeds {
+		out[job] = debugger.NeedsInput{Result: n.Result, Outputs: n.Outputs}
+	}
+	for job, n := range cliMap {
+		out[job] = n
+	}
+	return out, nil
+}
+
+// resolveEnvironments turns the config's per-`environment:` overlays into the core's
+// EnvOverlay shape: each environment's secret-file is read into a flat secret map (a
+// missing/unreadable file is an error — the path was given explicitly), and its inline
+// vars pass through. Returns nil when no environments are configured.
+func resolveEnvironments(cfgEnvs map[string]config.EnvOverlay) (map[string]debugger.EnvOverlay, error) {
+	if len(cfgEnvs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]debugger.EnvOverlay, len(cfgEnvs))
+	for name, ov := range cfgEnvs {
+		var secrets map[string]string
+		if ov.SecretFile != "" {
+			// Non-fatal on a missing file: only the debugged job's environment
+			// overlay is actually used, so an absent secret-file for some other
+			// environment must not fail the run (you may hold .secrets.prod only on
+			// the box that debugs prod). A malformed file still errors. The overlay's
+			// secret count in the transparency line shows what actually loaded.
+			m, err := loadConfig(nil, ov.SecretFile, false, nil)
+			if err != nil {
+				return nil, fmt.Errorf("environment %s: %w", name, err)
+			}
+			secrets = m
+		}
+		out[name] = debugger.EnvOverlay{Secrets: secrets, Vars: ov.Vars}
+	}
+	return out, nil
+}
+
+// splitBreakpoints separates config breakpoints into explicit step indices and step
+// names (the core resolves names against the job's steps).
+func splitBreakpoints(bps []config.Breakpoint) (indices []int, names []string) {
+	for _, b := range bps {
+		if b.Name != "" {
+			names = append(names, b.Name)
+		} else {
+			indices = append(indices, b.Index)
+		}
+	}
+	return indices, names
+}
+
+// printListing renders `actl -list`: each job (with its environment and matrix
+// combinations) and its steps, to stdout.
+func printListing(l *debugger.Listing) {
+	fmt.Printf("%s (event: %s)\n", l.WorkflowPath, l.Event)
+	for _, job := range l.Jobs {
+		label := job.ID
+		if job.Name != "" && job.Name != job.ID {
+			label += " (" + job.Name + ")"
+		}
+		fmt.Printf("\njob: %s\n", label)
+		if job.Environment != "" {
+			fmt.Printf("  environment: %s\n", job.Environment)
+		}
+		if len(job.Matrix) > 0 {
+			fmt.Printf("  matrix: %s\n", strings.Join(job.Matrix, " | "))
+		}
+		for _, st := range job.Steps {
+			fmt.Printf("  %2d. [%s] %s\n", st.Index, st.Kind, st.Label)
+		}
+	}
 }
 
 // gatherGCPIdentity resolves the dev's ambient GCP credentials for substitution,

@@ -10,6 +10,7 @@ require (
 	github.com/moby/moby/client v0.3.0
 	github.com/nektos/act v0.2.89
 	github.com/sirupsen/logrus v1.9.3
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -101,7 +102,6 @@ require (
 	golang.org/x/term v0.42.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
 

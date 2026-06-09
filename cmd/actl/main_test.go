@@ -10,7 +10,7 @@ import (
 func TestResolveWorkflowPath(t *testing.T) {
 	// An explicit argument always wins, no discovery.
 	t.Run("explicit arg passes through", func(t *testing.T) {
-		got, err := resolveWorkflowPath("some/where.yml")
+		got, err := resolveWorkflowPath("some/where.yml", "")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -22,7 +22,7 @@ func TestResolveWorkflowPath(t *testing.T) {
 	// The discovery branches all scan ".", so run them from a temp cwd.
 	t.Run("one discovered", func(t *testing.T) {
 		chdir(t, withWorkflows(t, "ci.yml"))
-		got, err := resolveWorkflowPath("")
+		got, err := resolveWorkflowPath("", "")
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -33,7 +33,7 @@ func TestResolveWorkflowPath(t *testing.T) {
 
 	t.Run("none discovered", func(t *testing.T) {
 		chdir(t, t.TempDir())
-		_, err := resolveWorkflowPath("")
+		_, err := resolveWorkflowPath("", "")
 		if err == nil || !strings.Contains(err.Error(), "no workflow found") {
 			t.Fatalf("want a 'no workflow found' error, got %v", err)
 		}
@@ -41,7 +41,7 @@ func TestResolveWorkflowPath(t *testing.T) {
 
 	t.Run("several discovered", func(t *testing.T) {
 		chdir(t, withWorkflows(t, "a.yml", "b.yml"))
-		_, err := resolveWorkflowPath("")
+		_, err := resolveWorkflowPath("", "")
 		if err == nil || !strings.Contains(err.Error(), "found 2 workflows") {
 			t.Fatalf("want a multi-workflow error, got %v", err)
 		}
@@ -84,7 +84,7 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	// File loads; a KEY=VALUE override wins over the file's value.
-	got, err := loadConfig(file, true, []string{"TOKEN=override"})
+	got, err := loadConfig(nil, file, true, []string{"TOKEN=override"})
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -99,16 +99,16 @@ func TestLoadConfig(t *testing.T) {
 func TestLoadConfigMissing(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope")
 	// Default path (not explicit): absent file is fine, overrides still apply.
-	got, err := loadConfig(missing, false, []string{"A=1"})
+	got, err := loadConfig(nil, missing, false, []string{"A=1"})
 	if err != nil || got["A"] != "1" {
 		t.Errorf("default missing: got %v, err %v", got, err)
 	}
 	// Nothing at all → nil map, no error.
-	if got, err := loadConfig(missing, false, nil); err != nil || got != nil {
+	if got, err := loadConfig(nil, missing, false, nil); err != nil || got != nil {
 		t.Errorf("empty: got %v, err %v; want nil,nil", got, err)
 	}
 	// Explicitly pointed at a missing file → error (likely a typo).
-	if _, err := loadConfig(missing, true, nil); err == nil {
+	if _, err := loadConfig(nil, missing, true, nil); err == nil {
 		t.Error("explicit missing: want error, got nil")
 	}
 }

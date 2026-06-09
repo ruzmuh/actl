@@ -120,6 +120,9 @@ func noticeLines(sess *debugger.Session) []string {
 	if cfg := configLine(sess.ConfigSummary()); cfg != "" {
 		lines = append(lines, cfg)
 	}
+	if env := envLine(sess.EnvSummary()); env != "" {
+		lines = append(lines, env)
+	}
 	lines = append(lines, tokenLine(sess.TokenSummary()))
 	if in := inputsLine(sess.InputsSummary()); in != "" {
 		lines = append(lines, in)
@@ -142,6 +145,21 @@ func noticeLines(sess *debugger.Session) []string {
 	lines = append(lines, gcpLines(sess.GCPSummary())...)
 	lines = append(lines, awsLines(sess.AWSSummary())...)
 	return lines
+}
+
+// envLine renders the per-`environment:` overlay applied for the debugged job: the
+// deployment environment it targets and how many secrets/vars its overlay contributed.
+// GHA scopes secrets/vars by environment, so debugging deploy-prod with staging values
+// is silently wrong — this honest notice is the point (CLAUDE.md §4 multi-env). Empty
+// when the job targets no environment.
+func envLine(s debugger.EnvSummary) string {
+	if s.Name == "" {
+		return ""
+	}
+	if s.Secrets == 0 && s.Vars == 0 {
+		return fmt.Sprintf("environment %q targeted — no overlay in .actl.yml (using flat secrets/vars)", s.Name)
+	}
+	return fmt.Sprintf("environment %q → loaded its overlay (%d secret(s), %d var(s))", s.Name, s.Secrets, s.Vars)
 }
 
 // servicesLine renders the job's `services:` containers. act starts them natively
