@@ -6,20 +6,21 @@ re-run a step — with **faithful `uses:` execution**, because it stands on
 [`nektos/act`](https://github.com/nektos/act) instead of reimplementing the Actions engine.
 
 > Status: pre-v0.1, under active development. Go. MIT. FOSS, no monetization.
-> See [CLAUDE.md](./CLAUDE.md) for the full design.
 >
 > Working today: single-job debugging through act's real engine — pause before/after
 > every step, env inspector, drop into the live job container, edit a step's command or
-> env and re-run it in place, breakpoints + run-to-cursor, job selection, isolated-run
-> `needs` seeding, secrets / vars / env loading, and ambient GCP identity substitution
-> — each with a transparency line.
+> env and re-run it in place, breakpoints + run-to-cursor, job selection, matrix pinning,
+> isolated-run `needs` seeding, secrets / vars / env loading, a committable `.actl.yml`
+> config with per-environment overlays, `-list` inventory, GitHub & runtime-context
+> seeding, and ambient GCP **and AWS** identity substitution — each with a transparency
+> line.
 
 ## Why
 
 `act` runs Actions workflows locally and faithfully — but as a batch runner: it has no
 breakpoints, no pause-before-step, no drop-into-shell. `actl` adds that debug layer on top
-of `act`, the way `lazygit` sits on `git`. Nobody else combines interactive step-debugging
-with faithful `uses:` execution (docker / composite / node actions).
+of `act`, so `uses:` (docker / composite / node actions) runs through act's real engine
+while you step through the job.
 
 ## Architecture (short version)
 
@@ -30,6 +31,9 @@ with faithful `uses:` execution (docker / composite / node actions).
   `runner.Config`. The fork lives in [`third_party/act`](./third_party/act), wired in via a
   `replace` directive in `go.mod`, pinned to a release. We keep the diff tiny and aim to
   upstream the hook.
+- **Frontend-agnostic core.** The debug engine (`internal/debugger`) owns no terminal and
+  imports no frontend; the TUI is one consumer, with headless/agent and DAP front-ends as
+  future peers behind the same API.
 
 ## Layout
 
@@ -38,6 +42,7 @@ cmd/actl/           TUI entry point
 cmd/spike-barrier/  line-based driver over the core (dev/debug aid)
 internal/debugger/  the pause-barrier core: Session, pause/step/continue, log capture
 internal/tui/       Bubble Tea front-end over the core
+internal/config/    loads .actl.yml (the debug slice: job/matrix/breakpoints/images/…)
 internal/workflow/  thin wrapper over act/pkg/model
 internal/expr/      thin wrapper over act/pkg/exprparser
 third_party/act/    soft fork of act — git submodule → ruzmuh/act (branch actl), pinned by SHA
@@ -59,12 +64,26 @@ go run ./cmd/actl path/to/workflow.yml     # your own workflow
 go run ./cmd/actl -image node:20-bullseye-slim   # smaller image for quick run-only workflows
 ```
 
+`go test ./...` runs the tests (no Docker needed).
+
 ### TUI keys
 
 When paused: `s`/`enter` step · `c` continue · `g` run-to-cursor · `↑↓`/`jk` move cursor ·
 `b` toggle breakpoint · `e` env pane · `i` edit step command · `E` edit job env ·
 `r` re-run the step in the live container · `d` drop into a shell in the container · `q` quit.
-The run halts before the first step; break-on-error halts after a failing step.
+The log pane scrolls any time (paused or running): `PgUp`/`PgDn` page, `ctrl+u`/`ctrl+d`
+half-page, `home`/`end` jump to top/bottom, mouse wheel. The run halts before the first
+step; break-on-error halts after a failing step.
+
+### Listing the workflow (`-list`)
+
+`-list` inventories a workflow — its jobs, each job's steps, any matrix combinations, and
+the deployment `environment:` — and exits **without** running Docker or shelling out for
+identity. Use it to discover the job and step names you'll target.
+
+```sh
+go run ./cmd/actl -list testdata/workflows/pipeline.yml
+```
 
 ### Selecting a job & seeding `needs`
 
@@ -96,6 +115,22 @@ upstream jobs for real to completion first, then pauses only on the target job's
 go run ./cmd/actl -job deploy --with-deps testdata/workflows/pipeline.yml
 ```
 
+### Matrix
+
+A job whose `matrix` expands to more than one combination must be pinned to exactly one —
+`-list` shows the combinations, and `-matrix KEY=VALUE` (repeatable) selects it:
+
+```sh
+go run ./cmd/actl -job test \
+  -matrix 'os=ubuntu-latest' -matrix 'go=1.22' \
+  testdata/workflows/matrix.yml
+```
+
+The single `-image` default maps `ubuntu-latest`; to map other runner labels to images use
+`-platform LABEL=IMAGE` (repeatable, act's `-P`; overrides the `images:` map in `.actl.yml`).
+When a job declares `services:`, act starts those service containers and the TUI prints a
+line naming them.
+
 ### Secrets, vars & env
 
 `actl` reads act's dotenv triple from the working dir — `.secrets` → `secrets.*`,
@@ -117,6 +152,85 @@ go run ./cmd/actl -secret-file ~/.config/actl/demo.secrets \
 
 The TUI prints a **redacted** transparency line naming what loaded — counts and names
 only, never values — and act masks secret values in the step logs.
+
+### Configuration (`.actl.yml`)
+
+For a real workflow, stash the debug slice in a committable **`.actl.yml`** instead of a
+flag soup. It's auto-discovered as `.actl.yml` in the working dir (point elsewhere with
+`-config FILE`). Precedence is **CLI flag > `.actl.yml` > built-in default**, and unknown
+keys are rejected so typos surface immediately.
+
+```yaml
+# .actl.yml — every key optional
+workflow: .github/workflows/deploy.yml   # a path arg still wins
+job: deploy
+event: push
+matrix:                                  # pin one combination
+  os: ubuntu-latest
+with-deps: false                         # true = run upstream needs for real first
+
+images:                                  # act's -P: runner label -> docker image
+  ubuntu-latest: catthehacker/ubuntu:act-latest
+  ubuntu-22.04: catthehacker/ubuntu:act-22.04
+
+breakpoints:                             # step index OR step name
+  - 0
+  - "Build"
+
+# workdir: .          # bind-mount this dir (writable) so local 'uses: ./' resolve
+# source: .           # tree a default actions/checkout copies from
+
+secret-file: .secrets                    # secrets are FILE-ONLY here (see below)
+vars:
+  REGION: us-east-1
+env:
+  LOG_LEVEL: debug
+
+inputs:                                  # workflow_dispatch / workflow_call
+  version: "1.2.3"
+# needs:                                 # seed upstream needs for isolated debugging
+#   lint:
+#     result: success
+#     outputs: { sha: abc123 }
+```
+
+Because `.actl.yml` is committable, **secrets can't be inlined** — an inline `secrets:`
+map (top level or under an environment) is a hard error; reference a gitignored dotenv via
+`secret-file:` instead. `vars`/`env` are not sensitive and may be inlined. A copy with
+inline comments lives in [`.actl.yml.sample`](./.actl.yml.sample).
+
+#### Per-environment overlays
+
+GitHub scopes `secrets.*`/`vars.*` by deployment `environment:`. When the debugged job
+targets one, the matching block under `environments:` **overlays** the flat `secret-file`/
+`vars` defaults (a CLI `-secret`/`-var` still wins). The TUI prints which overlay loaded
+(counts only):
+
+```yaml
+environments:
+  production:
+    secret-file: .secrets.prod
+    vars: { REGION: us-west-2 }
+  staging:
+    vars: { REGION: eu-west-1 }
+```
+
+### GitHub & runtime context
+
+GitHub injects context a clean local runner lacks; `actl` seeds it and prints a
+transparency line for each:
+
+- **`github.token` / `secrets.GITHUB_TOKEN`** — from `-github-token`, else a `GITHUB_TOKEN`
+  in `.secrets`, else ambient `gh auth token`; the two stay equal as on GitHub. It is **not**
+  auto-exported as `$GITHUB_TOKEN` (faithful — map it via `env:`). Heads-up: your token's
+  scope differs from CI's ephemeral, repo-scoped one.
+- **Workflow inputs** — `-input NAME=VALUE` (repeatable) for `workflow_dispatch` /
+  `workflow_call`; act applies the declared `default:` and boolean typing itself, so you
+  only supply the values you want to override.
+- **Event payload** — `-event-file PATH.json` sets `github.event.*`.
+- **`github.*` context** — `-repository`/`-ref`/`-sha`/`-actor` override the respective
+  fields; otherwise repository/ref/sha are derived from your local git (`origin` remote,
+  HEAD). `actor`, `run_id`, and `run_number` are honest placeholders.
 
 ### Workspace
 
@@ -147,16 +261,18 @@ checkout pinned to another repo/ref/path is left as a real clone.
 go run ./cmd/actl testdata/workflows/checkout.yml
 ```
 
-### Cloud identity (GCP)
+### Cloud identity (GCP & AWS)
 
-In real CI, `google-github-actions/auth` + `id-token: write` mints a GitHub-signed
-OIDC token and exchanges it for short-lived Google credentials. **Locally there is no
-GitHub OIDC issuer**, so that step can't federate — it would fail and kill the job.
-`actl` **intercepts** it: rewrites it to a no-op and injects your *ambient* gcloud
-Application Default Credentials, so later steps (`gcloud`/`gsutil`, `setup-gcloud`,
-client libraries) run as **you**. The TUI prints a transparency line — what the step
-*would* federate as vs the local identity it runs as — because you're testing under
-your own permissions, not the workflow's federated scope.
+In real CI, a login action (`google-github-actions/auth`, `aws-actions/configure-aws-credentials`)
+plus `id-token: write` mints a GitHub-signed OIDC token and exchanges it for short-lived
+cloud credentials. **Locally there is no GitHub OIDC issuer**, so that step can't federate —
+it would fail and kill the job. `actl` **intercepts** it: rewrites it to a no-op and injects
+your *ambient* credentials, so later steps run as **you**. The TUI prints a transparency line
+— what the step *would* federate as vs the local identity it runs as — because you're testing
+under your own permissions, not the workflow's federated scope.
+
+**GCP** — `actl` injects your gcloud Application Default Credentials so later steps
+(`gcloud`/`gsutil`, `setup-gcloud`, client libraries, terraform) run as you:
 
 ```sh
 gcloud auth application-default login        # once, so the ADC file exists
@@ -168,25 +284,35 @@ It mounts your ADC file read-only into the container and sets
 `CLOUDSDK_AUTH_ACCESS_TOKEN` (so gcloud/gsutil and `setup-gcloud` authenticate). Point
 at a specific credential file with `-gcp-credentials FILE`, or leave the auth step
 untouched (real federation) with `-gcp-identity=false`. The access token lives ~1h; the
-credential file keeps client libraries working past that.
+credential file keeps client libraries working past that. `actl` doesn't inject a
+**project** — that's the workflow's concern, exactly as on GitHub (the command's
+`--project`, or a `GOOGLE_CLOUD_PROJECT` you pass via `.env` / `-env`). A `gcloud` call
+with no project resolved fails the same way it would in CI (*"Project id: 0 is invalid"*).
 
-`actl` doesn't inject a **project** — that's the workflow's concern, exactly as on
-GitHub (the command's `--project`, or a `GOOGLE_CLOUD_PROJECT` you pass via `.env` /
-`-env`). A `gcloud` call with no project resolved fails the same way it would in CI
-(*"Project id: 0 is invalid"*). GCP is the first provider; AWS/Azure are on the roadmap.
+**AWS** — same shape: `actl` injects your ambient AWS credentials (env-only, no file
+mount), resolved from the default profile / environment or `-aws-profile NAME`; the region
+is injected when known. Disable with `-aws-identity=false` to leave the step untouched.
 
-`go test ./...` runs the tests (no Docker needed).
+```sh
+aws sso login        # or any way your ambient credentials are established
+go run ./cmd/actl -aws-profile dev testdata/workflows/aws-auth.yml
+```
+
+GCP and AWS are done; **Azure** is the remaining provider on the roadmap.
 
 ## Roadmap
 
-See the *First tasks* and *Scope — v0.1* sections of [CLAUDE.md](./CLAUDE.md). Done so far:
-library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI (step/inspect/shell/
-edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated `needs` seeding ✓ →
-run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:` (node / docker / composite) ✓ →
-workspace mount for local actions (`-workdir`) ✓ → faithful `actions/checkout` (copies your
-local working tree) ✓ → secrets / vars / env from act's dotenv triple ✓ → ambient GCP
-identity substitution (`google-github-actions/auth`) ✓.
-Next: AWS/Azure identity → full multi-job graph → upstream the hook(s).
+Done so far: library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI
+(step/inspect/shell/edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated
+`needs` seeding ✓ → run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:`
+(node / docker / composite) ✓ → workspace mount for local actions (`-workdir`) ✓ →
+faithful `actions/checkout` (copies your local working tree) ✓ → secrets / vars / env from
+act's dotenv triple ✓ → matrix selection + services line ✓ → `.actl.yml` config + `-list`
+inventory ✓ → per-environment overlays ✓ → GitHub & runtime-context seeding ✓ → ambient
+GCP and AWS identity substitution ✓.
+
+Next: Azure identity → full multi-job graph → high-fidelity OIDC → headless / agent mode →
+upstream the hook(s).
 
 ## License
 
