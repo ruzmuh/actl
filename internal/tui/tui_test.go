@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -391,5 +392,38 @@ func TestGCPLines(t *testing.T) {
 	// no auth step: nothing rendered
 	if got := gcpLines(debugger.GCPSummary{}); got != nil {
 		t.Errorf("no auth step should render nothing, got %v", got)
+	}
+}
+
+// TestWriteShellEnvFile locks the secret-safe shell env handoff: env reaches
+// the container via a 0600 --env-file (KEY=VALUE per line, sorted, empty values
+// kept) instead of `docker exec -e` argv where `ps` could read secret values.
+func TestWriteShellEnvFile(t *testing.T) {
+	path, err := writeShellEnvFile(map[string]string{
+		"SECRET":   "s3cr3t",
+		"GREETING": "hi",
+		"EMPTY":    "",
+	})
+	if err != nil {
+		t.Fatalf("writeShellEnvFile: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("env file perm = %o, want 600 (secrets must not be world-readable)", perm)
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// sorted keys, each with an explicit `=` so an empty value can't fall back
+	// to the host's $KEY.
+	if want := "EMPTY=\nGREETING=hi\nSECRET=s3cr3t\n"; string(b) != want {
+		t.Errorf("env file = %q, want %q", b, want)
 	}
 }

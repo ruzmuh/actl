@@ -490,6 +490,16 @@ func New(opts Options) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// buildEvent may have written a temp event.json; the Session owns it and
+	// removes it on cleanup, but until it's constructed an early error return
+	// below (workdir/source Abs, MkdirTemp) would leak the file. Drop it on any
+	// failure path; cleared once the Session takes ownership.
+	ok := false
+	defer func() {
+		if !ok && eventFile != "" {
+			_ = os.Remove(eventFile)
+		}
+	}()
 	inputsSummary := summarizeInputs(run.Workflow, opts.EventName, opts.Inputs)
 	ghcEnv, ghcSummary := buildGitHubContext(opts)
 
@@ -581,6 +591,7 @@ func New(opts Options) (*Session, error) {
 		breakOnErr:      opts.BreakOnError,
 	}
 	s.factory = &logFactory{w: &lineWriter{sink: s.logs, stop: s.done, drop: isGitContextNoise}}
+	ok = true // Session now owns eventFile/tmpDir; cleanup() handles them past here
 
 	cfg := &runner.Config{
 		Workdir:    workdir,

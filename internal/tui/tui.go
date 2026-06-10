@@ -530,7 +530,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Hand the terminal to an interactive shell in the live
 					// container, then resume the TUI. The core stays out of the
 					// terminal; this is the frontend's job (CLAUDE.md §5).
-					return m, tea.ExecProcess(m.shellCmd(name), func(err error) tea.Msg { return shellDoneMsg{err} })
+					return m, m.shellCmd(name)
 				}
 			}
 		}
@@ -666,22 +666,53 @@ func (m Model) View() string {
 	return b.String()
 }
 
-// shellCmd builds a `docker exec -it` into the live container, injecting the
-// job env we captured so the shell matches the ENV pane (act passes step env
-// per-exec, so a plain exec would otherwise miss it — e.g. GREETING).
-func (m Model) shellCmd(name string) *exec.Cmd {
-	args := []string{"exec", "-it"}
-	env := m.sess.Env()
+// shellCmd hands the terminal to an interactive `docker exec -it` shell in the
+// live container, injecting the job env we captured so the shell matches the
+// ENV pane (act passes step env per-exec, so a plain exec would otherwise miss
+// it — e.g. GREETING). The env goes through a temp --env-file (CreateTemp is
+// 0600, removed when the shell exits) rather than -e KEY=VALUE argv, so secret
+// values never surface in the host's `ps`.
+func (m Model) shellCmd(name string) tea.Cmd {
+	path, err := writeShellEnvFile(m.sess.Env())
+	if err != nil {
+		return func() tea.Msg { return shellDoneMsg{err} }
+	}
+	c := exec.Command("docker", "exec", "-it",
+		"--env-file", path,
+		name, "sh", "-c", "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh")
+	return tea.ExecProcess(c, func(runErr error) tea.Msg {
+		_ = os.Remove(path)
+		return shellDoneMsg{runErr}
+	})
+}
+
+// writeShellEnvFile writes env as a docker --env-file (one KEY=VALUE per line)
+// to a 0600 temp file (os.CreateTemp's default mode) and returns its path. The
+// caller removes it when the shell exits. Going through a file keeps secret
+// values out of the `docker exec` argv, where they'd otherwise be visible in
+// the host's `ps`.
+func writeShellEnvFile(env map[string]string) (string, error) {
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
-		args = append(args, "-e", k+"="+env[k])
+
+	f, err := os.CreateTemp("", "actl-shell-*.env")
+	if err != nil {
+		return "", err
 	}
-	args = append(args, name, "sh", "-c", "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh")
-	return exec.Command("docker", args...)
+	for _, k := range keys {
+		// Always emit the `=` so an empty value stays empty rather than falling
+		// back to the host's $KEY. A value's own newlines can't be represented
+		// (the same single-line limit the old -e argv had).
+		fmt.Fprintf(f, "%s=%s\n", k, env[k])
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // runToCursor resumes and halts before the step under the cursor, using a
