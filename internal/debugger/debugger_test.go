@@ -973,9 +973,9 @@ func TestBuildGitHubContext(t *testing.T) {
 // the Session summaries the TUI reads (token, event, github.* context).
 func TestRuntimeContextWiring(t *testing.T) {
 	s, err := New(Options{
-		WorkflowPath: sampleWorkflow,
-		Workdir:      t.TempDir(),
-		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_x"},
+		WorkflowPath:    sampleWorkflow,
+		Workdir:         t.TempDir(),
+		Secrets:         map[string]string{"GITHUB_TOKEN": "ghp_x"},
 		Repository:      "o/r",
 		Ref:             "refs/heads/feature",
 		Sha:             "deadbeefcafebabe",

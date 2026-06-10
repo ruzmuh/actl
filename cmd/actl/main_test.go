@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ruzmuh/actl/internal/debugger"
 )
 
 func TestResolveWorkflowPath(t *testing.T) {
@@ -142,20 +144,17 @@ func TestFindADCFile(t *testing.T) {
 	}
 }
 
-func TestWorkflowHasGCPAuth(t *testing.T) {
-	if !workflowHasGCPAuth("../../testdata/workflows/gcp-auth.yml") {
+func TestWorkflowUses(t *testing.T) {
+	if !workflowUses("../../testdata/workflows/gcp-auth.yml", debugger.GCPAuthAction) {
 		t.Error("gcp-auth.yml: want true")
 	}
-	if workflowHasGCPAuth("../../testdata/workflows/config.yml") {
+	if workflowUses("../../testdata/workflows/config.yml", debugger.GCPAuthAction) {
 		t.Error("config.yml: want false (no auth step)")
 	}
-}
-
-func TestWorkflowHasAWSAuth(t *testing.T) {
-	if !workflowHasAWSAuth("../../testdata/workflows/aws-auth.yml") {
+	if !workflowUses("../../testdata/workflows/aws-auth.yml", debugger.AWSAuthAction) {
 		t.Error("aws-auth.yml: want true")
 	}
-	if workflowHasAWSAuth("../../testdata/workflows/config.yml") {
+	if workflowUses("../../testdata/workflows/config.yml", debugger.AWSAuthAction) {
 		t.Error("config.yml: want false (no auth step)")
 	}
 }

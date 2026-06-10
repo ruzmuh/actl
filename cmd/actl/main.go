@@ -456,7 +456,7 @@ func printListing(l *debugger.Listing) {
 // neutralizes the auth step and the TUI reports honestly). Returns nil when there's
 // no auth step, or neither a credential file nor a token could be found.
 func gatherGCPIdentity(path, credOverride string) *debugger.GCPIdentity {
-	if !workflowHasGCPAuth(path) {
+	if !workflowUses(path, debugger.GCPAuthAction) {
 		return nil
 	}
 	file := findADCFile(credOverride)
@@ -471,16 +471,18 @@ func gatherGCPIdentity(path, credOverride string) *debugger.GCPIdentity {
 	}
 }
 
-// workflowHasGCPAuth reports whether any job in the workflow uses
-// google-github-actions/auth (a cheap pre-scan to keep gcloud invocation lazy).
-func workflowHasGCPAuth(path string) bool {
+// workflowUses reports whether any job in the workflow at path uses action (bare
+// or @version) — a cheap pre-scan to keep cloud-CLI invocation lazy. A parse error
+// is treated as "no" (it resurfaces later in debugger.New). The match logic lives
+// in debugger.StepUses so the action literals have a single home.
+func workflowUses(path, action string) bool {
 	wf, err := workflow.Load(path, true)
 	if err != nil {
 		return false // a real parse error surfaces later in debugger.New
 	}
 	for _, job := range wf.Jobs {
 		for _, st := range job.Steps {
-			if st.Uses == "google-github-actions/auth" || strings.HasPrefix(st.Uses, "google-github-actions/auth@") {
+			if debugger.StepUses(st, action) {
 				return true
 			}
 		}
@@ -495,7 +497,7 @@ func workflowHasGCPAuth(path string) bool {
 // (static keys, SSO, an already-assumed role) into concrete credentials. Returns nil
 // when there's no auth step or no resolvable credentials.
 func gatherAWSIdentity(path, profile string) *debugger.AWSIdentity {
-	if !workflowHasAWSAuth(path) {
+	if !workflowUses(path, debugger.AWSAuthAction) {
 		return nil
 	}
 	creds := awsExportCredentials(profile)
@@ -508,23 +510,6 @@ func gatherAWSIdentity(path, profile string) *debugger.AWSIdentity {
 		SessionToken:    creds["AWS_SESSION_TOKEN"],
 		Account:         awsValue(profile, "sts", "get-caller-identity", "--query", "Arn", "--output", "text"),
 	}
-}
-
-// workflowHasAWSAuth reports whether any job uses aws-actions/configure-aws-credentials
-// (a cheap pre-scan to keep the aws CLI invocation lazy).
-func workflowHasAWSAuth(path string) bool {
-	wf, err := workflow.Load(path, true)
-	if err != nil {
-		return false // a real parse error surfaces later in debugger.New
-	}
-	for _, job := range wf.Jobs {
-		for _, st := range job.Steps {
-			if st.Uses == "aws-actions/configure-aws-credentials" || strings.HasPrefix(st.Uses, "aws-actions/configure-aws-credentials@") {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // awsExportCredentials runs `aws configure export-credentials --format env-no-export`
