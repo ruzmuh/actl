@@ -280,7 +280,11 @@ func TestRuntimeBannerRender(t *testing.T) {
 	}
 
 	var m tea.Model = New(sess, func() {})
-	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	// Wide enough that no notice is truncated: the layout contract clips each
+	// notice to one un-wrapped row, and the github-context line is ~160 cols, so a
+	// narrow width would cut its tail. This test checks the banner *content* is
+	// assembled and reaches the View, not the truncation behaviour.
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
 	got := m.View()
 	t.Logf("\n%s", got)
 

@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/ruzmuh/actl/internal/debugger"
 )
@@ -428,7 +429,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.logVP.Width = m.paneWidth()
+		m.logVP.Width = m.innerWidth()
 		m.logVP.Height = m.logViewportHeight()
 		m.setLogContent()
 		return m, nil
@@ -611,37 +612,92 @@ var (
 	statusStyle = lipgloss.NewStyle().Bold(true)
 )
 
+// Layout contract: the title row and the footer are always on screen, notices
+// take one (truncated) row each and never more than maxNoticeRows, the STEPS
+// pane shows at most maxStepRows step rows (a window around the focused step),
+// and the log/env pane absorbs whatever height is left. Nothing word-wraps, so
+// every element's row count is fixed and the total never overflows the terminal.
+const (
+	maxNoticeRows = 6
+	maxStepRows   = 10
+	// footerRows is fixed so the height budget doesn't depend on run state: the
+	// footer is two rows when paused (status + keybar) and one otherwise, and the
+	// log viewport height is only recomputed on resize — letting the footer grow
+	// from one row to two at pause time would otherwise overflow the view and
+	// scroll the title off the top. View pads the footer to this height.
+	footerRows = 2
+)
+
+// clip truncates a possibly-styled string to w columns with an ellipsis,
+// ANSI-aware, so a single-line element never wraps and breaks the height budget.
+func clip(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	return ansi.Truncate(s, w, "…")
+}
+
+// clipLines truncates each line of a multi-line block to w columns.
+func clipLines(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	parts := strings.Split(s, "\n")
+	for i := range parts {
+		parts[i] = ansi.Truncate(parts[i], w, "…")
+	}
+	return strings.Join(parts, "\n")
+}
+
+// boxed renders body in the rounded pane and splices the title into the top
+// border (╭─ TITLE ──╮), so the title costs no interior row — the pane is just
+// its two border rows plus the body.
+func (m Model) boxed(title, body string) string {
+	box := paneStyle.Width(m.paneWidth()).Render(body)
+	lines := strings.SplitN(box, "\n", 2)
+	if len(lines) == 0 {
+		return box
+	}
+	lines[0] = spliceTitle(lines[0], title)
+	return strings.Join(lines, "\n")
+}
+
+// spliceTitle overlays " title " onto a pane's top border line, keeping the two
+// corner runes. The border carries no color, so plain rune surgery is safe.
+func spliceTitle(top, title string) string {
+	if title == "" {
+		return top
+	}
+	r := []rune(top)
+	if len(r) < 6 { // ╭──╮ with no room for a label
+		return top
+	}
+	avail := len(r) - 4 // leave ╭─ … ─╮
+	t := []rune(title)
+	if len(t)+2 > avail {
+		if avail-2 <= 0 {
+			return top
+		}
+		t = t[:avail-2]
+	}
+	label := append(append([]rune{' '}, t...), ' ')
+	out := make([]rune, len(r))
+	copy(out, r)
+	for i, c := range label {
+		out[2+i] = c
+	}
+	return string(out)
+}
+
 func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("actl · "+m.title) + "\n")
-	for _, line := range m.notices {
-		b.WriteString(dimStyle.Render("⚠ "+line) + "\n")
+	if nb := m.noticeBlock(); nb != "" {
+		b.WriteString(nb + "\n")
 	}
 	b.WriteString("\n")
 
-	// step list: [breakpoint] [cursor] N. label (state)
-	var steps strings.Builder
-	for i, label := range m.labels {
-		bp := "  "
-		if m.breakpoints[i] {
-			bp = bpStyle.Render(" ●")
-		}
-		caret := "  "
-		if i == m.cursor {
-			caret = "❯ "
-		}
-		text := fmt.Sprintf("%d. %s", i+1, label)
-		switch {
-		case i == m.cur && m.state == statePaused:
-			text = curStyle.Render(text) + dimStyle.Render("  ("+m.curAt.String()+")")
-		case i == m.cur && m.state == stateRunning:
-			text = text + dimStyle.Render("  (running)")
-		case i < m.cur || (i == m.cur && m.state == stateFinished):
-			text = dimStyle.Render(text)
-		}
-		steps.WriteString(bp + caret + text + "\n")
-	}
-	b.WriteString(paneStyle.Width(m.paneWidth()).Render("STEPS\n"+strings.TrimRight(steps.String(), "\n")) + "\n")
+	b.WriteString(m.stepsPane() + "\n")
 
 	// bottom pane: env (while inspecting) or log tail
 	if m.showEnv {
@@ -649,20 +705,26 @@ func (m Model) View() string {
 		if m.cur >= 0 {
 			title = fmt.Sprintf("ENV · job env at step %d %q", m.cur+1, m.stepLabel(m.cur))
 		}
-		b.WriteString(paneStyle.Width(m.paneWidth()).Render(title+"\n"+m.envPane()) + "\n")
+		b.WriteString(m.boxed(title, m.envPane()) + "\n")
 	} else {
 		title := "LOGS"
 		if !m.logVP.AtBottom() {
-			title += dimStyle.Render("  ↑ scrolled · End to follow")
+			title += " · ↑ scrolled · End to follow"
 		}
 		body := m.logVP.View()
 		if len(m.logs) == 0 {
 			body = dimStyle.Render("(no output yet)")
 		}
-		b.WriteString(paneStyle.Width(m.paneWidth()).Render(title+"\n"+body) + "\n")
+		b.WriteString(m.boxed(title, body) + "\n")
 	}
 
-	b.WriteString(m.statusLine())
+	// Pad the footer to footerRows so it always occupies exactly the height the
+	// budget reserved (the status is one row when running/done, two when paused).
+	status := m.statusLine()
+	for n := lipgloss.Height(status); n < footerRows; n++ {
+		status += "\n"
+	}
+	b.WriteString(status)
 	return b.String()
 }
 
@@ -836,13 +898,14 @@ func (m Model) envPane() string {
 	sort.Strings(keys)
 
 	limit := m.logViewportHeight()
+	inner := m.innerWidth()
 	var b strings.Builder
 	for i, k := range keys {
 		if i >= limit {
 			b.WriteString(dimStyle.Render(fmt.Sprintf("… %d more", len(keys)-limit)))
 			break
 		}
-		b.WriteString(keyStyle.Render(k) + dimStyle.Render("=") + env[k] + "\n")
+		b.WriteString(clip(keyStyle.Render(k)+dimStyle.Render("=")+env[k], inner) + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -852,6 +915,17 @@ func (m Model) paneWidth() int {
 		return m.width - 4
 	}
 	return 76
+}
+
+// innerWidth is the text area inside a pane: its content width minus the
+// horizontal padding (0,1) on each side. Rows wider than this would wrap in the
+// terminal and silently grow the pane past its budgeted height.
+func (m Model) innerWidth() int {
+	w := m.paneWidth() - 2
+	if w < 1 {
+		return 1
+	}
+	return w
 }
 
 // appendLog adds one line to the log buffer (capped) and refreshes the viewport.
@@ -867,20 +941,114 @@ func (m *Model) appendLog(line string) {
 
 // setLogContent pushes the buffer into the viewport, following the tail unless
 // the user has scrolled up — then their position is preserved as lines arrive.
+// Each line is hard-wrapped to the viewport width so a long line occupies whole
+// rows of content (which the viewport windows by Height) instead of overflowing
+// and being wrapped by the terminal — terminal wrapping would grow the pane past
+// its budgeted height and scroll the title off the top.
 func (m *Model) setLogContent() {
 	follow := m.logVP.AtBottom()
-	m.logVP.SetContent(strings.Join(m.logs, "\n"))
+	w := m.logVP.Width
+	wrapped := make([]string, len(m.logs))
+	for i, line := range m.logs {
+		if w > 0 {
+			line = ansi.Hardwrap(line, w, false)
+		}
+		wrapped[i] = line
+	}
+	m.logVP.SetContent(strings.Join(wrapped, "\n"))
 	if follow {
 		m.logVP.GotoBottom()
 	}
 }
 
-// logViewportHeight is the row budget for the bottom pane's scrollable area:
-// total height minus the title, transparency notices, the blank spacer, the
-// STEPS pane (border + title + one row per step), the LOGS pane chrome
-// (border + title), and the two-line status block.
+// noticeBlock renders the transparency notices one per row, each truncated to the
+// terminal width (never wrapped) and capped at maxNoticeRows. Overflow past the
+// cap collapses into a "+N more" summary so the block height stays fixed and the
+// title above it can't be scrolled off the top.
+func (m Model) noticeBlock() string {
+	if len(m.notices) == 0 {
+		return ""
+	}
+	shown := m.notices
+	var extra int
+	if len(shown) > maxNoticeRows {
+		shown = shown[:maxNoticeRows-1]
+		extra = len(m.notices) - len(shown)
+	}
+	lines := make([]string, 0, len(shown)+1)
+	for _, line := range shown {
+		lines = append(lines, clip(dimStyle.Render("⚠ "+line), m.width))
+	}
+	if extra > 0 {
+		lines = append(lines, clip(dimStyle.Render(fmt.Sprintf("⚠ +%d more notices", extra)), m.width))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// stepsPane renders the STEPS pane: at most maxStepRows step rows. When there are
+// more steps, it shows a window around the focused step (the cursor, or the
+// running step) and notes the range in the title, so the active step is always
+// visible and the pane height stays bounded. Each row is truncated, never wrapped.
+func (m Model) stepsPane() string {
+	n := len(m.labels)
+	start, end := 0, n
+	title := "STEPS"
+	if n > maxStepRows {
+		focus := m.cursor
+		if m.state == stateRunning {
+			focus = m.cur
+		}
+		start = focus - maxStepRows/2
+		if start < 0 {
+			start = 0
+		}
+		if start+maxStepRows > n {
+			start = n - maxStepRows
+		}
+		end = start + maxStepRows
+		title = fmt.Sprintf("STEPS · %d–%d/%d", start+1, end, n)
+	}
+
+	inner := m.innerWidth()
+	var steps strings.Builder
+	for i := start; i < end; i++ {
+		bp := "  "
+		if m.breakpoints[i] {
+			bp = bpStyle.Render(" ●")
+		}
+		caret := "  "
+		if i == m.cursor {
+			caret = "❯ "
+		}
+		text := fmt.Sprintf("%d. %s", i+1, m.labels[i])
+		switch {
+		case i == m.cur && m.state == statePaused:
+			text = curStyle.Render(text) + dimStyle.Render("  ("+m.curAt.String()+")")
+		case i == m.cur && m.state == stateRunning:
+			text = text + dimStyle.Render("  (running)")
+		case i < m.cur || (i == m.cur && m.state == stateFinished):
+			text = dimStyle.Render(text)
+		}
+		if i > start {
+			steps.WriteByte('\n')
+		}
+		steps.WriteString(clip(bp+caret+text, inner))
+	}
+	return m.boxed(title, steps.String())
+}
+
+// logViewportHeight is the row budget for the bottom pane's scrollable area: the
+// terminal height minus everything with a fixed size — the title row, the blank
+// spacer, the (bounded) notice block, the (bounded) STEPS pane, the bottom pane's
+// own border (the title rides in the border), and the footer. Each is its real,
+// non-wrapping height, so the log/env pane gets exactly the slack and the total
+// fills the terminal without overflowing it.
 func (m Model) logViewportHeight() int {
-	used := 1 + len(m.notices) + 1 + (len(m.labels) + 3) + 3 + 2
+	noticeH := 0
+	if nb := m.noticeBlock(); nb != "" {
+		noticeH = lipgloss.Height(nb)
+	}
+	used := 1 + noticeH + 1 + lipgloss.Height(m.stepsPane()) + 2 + footerRows
 	h := m.height - used
 	if h < 3 {
 		return 3
@@ -889,20 +1057,25 @@ func (m Model) logViewportHeight() int {
 }
 
 func (m Model) statusLine() string {
+	var s string
 	switch m.state {
 	case statePaused:
 		where := fmt.Sprintf("%s step %d: %s", m.curAt.String(), m.cur+1, m.stepLabel(m.cur))
 		if m.curErr != nil {
 			where += errStyle.Render(" — step failed: " + m.curErr.Error())
 		}
-		return statusStyle.Render("⏸  paused "+where) +
+		s = statusStyle.Render("⏸  paused "+where) +
 			dimStyle.Render("\n   ↑↓ nav · b break · s step · c cont · g to-cursor · i edit-cmd · E edit-env · r rerun · e env · d shell · PgUp/PgDn scroll · q quit")
 	case stateRunning:
-		return statusStyle.Render("▶  running") + dimStyle.Render("   ·  ↑↓ nav · b break · PgUp/PgDn scroll · q quit")
+		s = statusStyle.Render("▶  running") + dimStyle.Render("   ·  ↑↓ nav · b break · PgUp/PgDn scroll · q quit")
 	default:
 		if m.runErr != nil {
-			return errStyle.Render("✖  run failed: "+m.runErr.Error()) + dimStyle.Render("   ·  [q]uit")
+			s = errStyle.Render("✖  run failed: "+m.runErr.Error()) + dimStyle.Render("   ·  [q]uit")
+		} else {
+			s = okStyle.Render("✓  run complete") + dimStyle.Render("   ·  [q]uit")
 		}
-		return okStyle.Render("✓  run complete") + dimStyle.Render("   ·  [q]uit")
 	}
+	// Clip each footer line to the width so the keybar can't wrap and push the
+	// footer past the bottom of the terminal.
+	return clipLines(s, m.width)
 }
