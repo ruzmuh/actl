@@ -899,10 +899,14 @@ func TestBuildEvent(t *testing.T) {
 	}
 }
 
-// TestBuildGitHubContext maps overrides to act's env keys (sha → SHA_REF) and lists
-// which fields were overridden; unset fields are left empty for act to derive.
+// TestBuildGitHubContext maps values to act's env keys (sha → SHA_REF) and marks as
+// overridden only the fields GitHubOverrides names — env injection follows non-empty
+// values, the override mark follows the explicit flag set (the two are independent).
 func TestBuildGitHubContext(t *testing.T) {
-	env, sum := buildGitHubContext(Options{Repository: "o/r", Ref: "refs/heads/x", Sha: "0123456789abcdef", Actor: "me"})
+	env, sum := buildGitHubContext(Options{
+		Repository: "o/r", Ref: "refs/heads/x", Sha: "0123456789abcdef", Actor: "me",
+		GitHubOverrides: []string{"repository", "ref", "sha", "actor"},
+	})
 	if env["GITHUB_REPOSITORY"] != "o/r" || env["GITHUB_REF"] != "refs/heads/x" || env["SHA_REF"] != "0123456789abcdef" {
 		t.Errorf("env wrong: %v", env)
 	}
@@ -911,6 +915,17 @@ func TestBuildGitHubContext(t *testing.T) {
 	}
 	if strings.Join(sum.Overridden, ",") != "repository,ref,sha,actor" {
 		t.Errorf("overridden wrong: %v", sum.Overridden)
+	}
+
+	// Values present (as if derived from local git) but no flag set → env is still
+	// injected, but nothing is marked an override. This is the bug guard: a plain run
+	// must not cry override over git-derived defaults.
+	env, sum = buildGitHubContext(Options{Repository: "o/r", Ref: "refs/heads/x", Sha: "0123456789abcdef"})
+	if env["GITHUB_REPOSITORY"] != "o/r" {
+		t.Errorf("derived value should still inject env: %v", env)
+	}
+	if len(sum.Overridden) != 0 {
+		t.Errorf("no flag set → no overrides, got %v", sum.Overridden)
 	}
 
 	// nothing set → empty env, no overrides
@@ -926,10 +941,11 @@ func TestRuntimeContextWiring(t *testing.T) {
 		WorkflowPath: sampleWorkflow,
 		Workdir:      t.TempDir(),
 		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_x"},
-		Repository:   "o/r",
-		Ref:          "refs/heads/feature",
-		Sha:          "deadbeefcafebabe",
-		Actor:        "alice",
+		Repository:      "o/r",
+		Ref:             "refs/heads/feature",
+		Sha:             "deadbeefcafebabe",
+		Actor:           "alice",
+		GitHubOverrides: []string{"repository", "ref", "sha", "actor"},
 	})
 	if err != nil {
 		t.Fatal(err)

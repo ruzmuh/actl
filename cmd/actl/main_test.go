@@ -224,3 +224,14 @@ func TestFirstNonEmpty(t *testing.T) {
 		t.Errorf("firstNonEmpty all-empty = %q, want empty", got)
 	}
 }
+
+func TestSetFlags(t *testing.T) {
+	set := map[string]bool{"ref": true, "actor": true}
+	got := setFlags(set, "repository", "ref", "sha", "actor")
+	if strings.Join(got, ",") != "ref,actor" {
+		t.Errorf("setFlags = %v, want [ref actor] in order", got)
+	}
+	if got := setFlags(map[string]bool{}, "repository", "ref"); got != nil {
+		t.Errorf("setFlags none set = %v, want nil", got)
+	}
+}

@@ -268,6 +268,11 @@ type Options struct {
 	Ref         string            // override github.ref (env GITHUB_REF); empty = act derives from local git
 	Sha         string            // override github.sha (env SHA_REF, act's read key); empty = act derives from local git
 	Actor       string            // override github.actor (Config.Actor); empty = act's "nektos/act" placeholder
+	// GitHubOverrides names the github.* fields the user set explicitly by flag (any of
+	// "repository"/"ref"/"sha"/"actor"), so the transparency line marks those as overrides.
+	// The values above may also be filled from local git for an honest display — only an
+	// entry here means the user overrode it, not merely that the value is non-empty.
+	GitHubOverrides []string
 }
 
 // When marks which side of a step's main executor a pause occurred on. It mirrors
@@ -1605,30 +1610,31 @@ func declaredInputs(wf *model.Workflow, event string) map[string]struct{} {
 	return out
 }
 
-// buildGitHubContext maps the github.* overrides to the env keys act reads when
+// buildGitHubContext maps the github.* values to the env keys act reads when
 // synthesizing the github context (github_context.go): GITHUB_REPOSITORY and
 // GITHUB_REF survive because act only derives them when unset, and the sha is read
 // from SHA_REF. Actor is handled via Config.Actor, not here. Returns the env to
-// layer onto -env plus a summary for the transparency line. Unset fields are left
-// for act to derive from local git (and the summary shows them empty).
+// layer onto -env plus a summary for the transparency line.
+//
+// Two independent things, deliberately kept apart: env injection happens for any
+// non-empty value (so a repo/ref/sha derived from local git still populates the
+// context), while the "(override)" mark comes only from opts.GitHubOverrides — the
+// fields the user actually set by flag. Conflating them (marking every non-empty
+// value an override) is the bug this guards against: after the CLI fills these from
+// git, almost everything is non-empty, so the transparency line would cry override
+// when the user overrode nothing.
 func buildGitHubContext(opts Options) (map[string]string, GitHubContextSummary) {
 	env := map[string]string{}
-	var overridden []string
 	if opts.Repository != "" {
 		env["GITHUB_REPOSITORY"] = opts.Repository
-		overridden = append(overridden, "repository")
 	}
 	if opts.Ref != "" {
 		env["GITHUB_REF"] = opts.Ref
-		overridden = append(overridden, "ref")
 	}
 	if opts.Sha != "" {
 		env["SHA_REF"] = opts.Sha // act reads the sha from SHA_REF (github_context.go)
-		overridden = append(overridden, "sha")
 	}
-	if opts.Actor != "" {
-		overridden = append(overridden, "actor")
-	}
+	overridden := append([]string(nil), opts.GitHubOverrides...)
 	return env, GitHubContextSummary{
 		Repository: opts.Repository,
 		Ref:        opts.Ref,

@@ -191,10 +191,11 @@ func TestRuntimeBannerRender(t *testing.T) {
 		Workdir:      t.TempDir(),
 		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_demo"},
 		Inputs:       map[string]string{"environment": "production"},
-		Repository:   "ruzmuh/actl",
-		Ref:          "refs/heads/feature",
-		Sha:          "deadbeefcafebabe",
-		Actor:        "ruzmuh",
+		Repository:      "ruzmuh/actl",
+		Ref:             "refs/heads/feature",
+		Sha:             "deadbeefcafebabe",
+		Actor:           "ruzmuh",
+		GitHubOverrides: []string{"repository", "ref", "sha", "actor"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -253,6 +254,10 @@ func TestRuntimeContextLines(t *testing.T) {
 		if !strings.Contains(ghc, want) {
 			t.Errorf("ghc line missing %q: %q", want, ghc)
 		}
+	}
+	// Only actor is overridden — the non-overridden fields must NOT carry the marker.
+	if strings.Contains(ghc, "o/r (override)") || strings.Contains(ghc, "refs/heads/main (override)") {
+		t.Errorf("non-overridden field marked as override: %q", ghc)
 	}
 	// empty fields fall back to act-derived / placeholder
 	if got := ghcLine(debugger.GitHubContextSummary{}); !strings.Contains(got, "repository=act-derived") || !strings.Contains(got, "actor=nektos/act (placeholder)") {

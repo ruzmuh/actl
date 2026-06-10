@@ -180,6 +180,10 @@ func main() {
 	// values; empty leaves it for act to derive.
 	gitDir := firstNonEmpty(sourceDir, workdirPath, ".")
 	repo, gref, gsha := resolveGitHubContext(gitDir, *repository, *ref, *sha)
+	// Which github.* fields the user set by flag (vs. derived from git above) — only
+	// these are real overrides, so the transparency line marks just them. resolveGitHubContext
+	// fills the rest from local git for honest display, which must NOT read as an override.
+	ghOverrides := setFlags(set, "repository", "ref", "sha", "actor")
 
 	opts := debugger.Options{
 		WorkflowPath:    path,
@@ -210,6 +214,7 @@ func main() {
 		Ref:             gref,
 		Sha:             gsha,
 		Actor:           *actor,
+		GitHubOverrides: ghOverrides,
 	}
 
 	if err := run(opts); err != nil {
@@ -641,6 +646,19 @@ func parseGitRepo(url string) string {
 		return ""
 	}
 	return url
+}
+
+// setFlags returns the subset of names the user set explicitly on the command line
+// (per the flag.Visit set map), preserving the given order — used to report which
+// github.* fields are real overrides rather than git-derived defaults.
+func setFlags(set map[string]bool, names ...string) []string {
+	var out []string
+	for _, n := range names {
+		if set[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // firstNonEmpty returns the first non-empty argument, or "" if all are empty.
