@@ -15,6 +15,38 @@ re-run a step — with **faithful `uses:` execution**, because it stands on
 > seeding, and ambient GCP **and AWS** identity substitution — each with a transparency
 > line.
 
+## Install
+
+All three routes need **Docker** at runtime — `actl` starts a real job container via act.
+
+**Homebrew (macOS):**
+
+```sh
+brew install ruzmuh/actl/actl
+```
+
+(A Homebrew *cask* — macOS only. On Linux, use a prebuilt binary or build from source.)
+
+**Prebuilt binary (macOS & Linux, amd64/arm64):** grab the archive for your platform from
+the [latest release](https://github.com/ruzmuh/actl/releases/latest), then:
+
+```sh
+tar -xzf actl_*_$(uname -s)_$(uname -m).tar.gz
+sudo mv actl /usr/local/bin/      # or anywhere on your PATH
+```
+
+**From source:** the act fork is a git submodule wired in via a filesystem `replace` in
+`go.mod`, so `go install github.com/ruzmuh/actl/...@latest` **won't work** (it can't resolve
+the local replace). Clone with the submodule first, then install from the checkout:
+
+```sh
+git clone --recurse-submodules https://github.com/ruzmuh/actl
+cd actl
+go install ./cmd/actl             # builds with the submodule on disk; binary lands in $GOBIN
+```
+
+Requires Go (the module pins the toolchain to match act; `go` auto-fetches it).
+
 ## Why
 
 `act` runs Actions workflows locally and faithfully — but as a batch runner: it has no

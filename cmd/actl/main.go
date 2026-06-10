@@ -26,6 +26,10 @@ import (
 	"github.com/ruzmuh/actl/internal/workflow"
 )
 
+// version is the actl release, stamped at build time via
+// -ldflags "-X main.version=…" (GoReleaser's default). "dev" for plain `go build`.
+var version = "dev"
+
 // stringSlice collects a repeatable string flag (e.g. -need a -need b).
 type stringSlice []string
 
@@ -58,6 +62,7 @@ func main() {
 	actor := flag.String("actor", "", "override github.actor (default: act's 'nektos/act' placeholder)")
 	configPath := flag.String("config", ".actl.yml", "project config file for the debug slice (job/matrix/breakpoints/secrets/vars/env); skipped if absent unless set explicitly")
 	list := flag.Bool("list", false, "list the workflow's jobs and steps (with matrix combinations and environment) without running, then exit")
+	showVersion := flag.Bool("version", false, "print actl version and exit")
 	var needs, envs, secrets, vars, inputs, matrix, platforms stringSlice
 	flag.Var(&matrix, "matrix", "pin a matrix combination: 'KEY=VALUE' (repeatable; required only if the job's matrix has more than one combination)")
 	flag.Var(&platforms, "platform", "map a runner label to a docker image: 'LABEL=IMAGE' (repeatable, act's -P; overrides .actl.yml images)")
@@ -71,6 +76,11 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("actl", version)
+		return
+	}
 
 	// Which flags the user set explicitly (vs left at their default) — drives the
 	// precedence rule CLI flag > .actl.yml > built-in default, and decides whether a

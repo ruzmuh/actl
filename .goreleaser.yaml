@@ -1,0 +1,72 @@
+# GoReleaser config for actl — builds static binaries for macOS/Linux,
+# publishes a GitHub Release, and updates the Homebrew tap formula.
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: actl
+
+builds:
+  - id: actl
+    main: ./cmd/actl
+    binary: actl
+    env:
+      - CGO_ENABLED=0
+      # Resolve act purely via the go.mod replace directive + the checked-out
+      # submodule; ignore any local go.work (it's gitignored, absent in CI).
+      - GOWORK=off
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: actl
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+
+# Homebrew cask (GoReleaser deprecated formula `brews:` in v2). Note: casks are
+# macOS-only — Linux users install from the GitHub Release archive instead.
+homebrew_casks:
+  - name: actl
+    repository:
+      owner: ruzmuh
+      name: homebrew-actl
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/ruzmuh/actl"
+    description: "TUI-first interactive step-debugger for GitHub Actions workflows, running locally on act"
+    # actl drives Docker (act starts a job container); it can't be a Homebrew
+    # dependency, so just tell the user.
+    caveats: "actl requires Docker to be installed and running — it launches a real job container via act."
+    # The binary isn't code-signed, so strip the Gatekeeper quarantine flag on
+    # install — otherwise macOS refuses to run it ("developer cannot be verified").
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/actl"]
+          end
