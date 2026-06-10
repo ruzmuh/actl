@@ -109,6 +109,33 @@ jobs:
 	}
 }
 
+// TestCheckoutWantsSubmodules covers mirroring actions/checkout's `submodules:`
+// input: only `true`/`recursive` (any case) fetch submodules; absent/false/empty
+// leave them out, so the local workspace copy skips them by default.
+func TestCheckoutWantsSubmodules(t *testing.T) {
+	cases := []struct {
+		with string
+		want bool
+	}{
+		{"", false},
+		{"false", false},
+		{"true", true},
+		{"recursive", true},
+		{"Recursive", true},
+		{"  true  ", true},
+		{"yes", false},
+	}
+	for _, c := range cases {
+		st := &model.Step{}
+		if c.with != "" {
+			st.With = map[string]string{"submodules": c.with}
+		}
+		if got := checkoutWantsSubmodules(st); got != c.want {
+			t.Errorf("checkoutWantsSubmodules(submodules=%q) = %v, want %v", c.with, got, c.want)
+		}
+	}
+}
+
 // TestInterceptSteps covers the shared scan/rewrite mechanic: a matching step is
 // rewritten to a no-op echoing the message, its label is preserved, non-matching
 // steps are left alone, and `capture` runs before With is cleared.

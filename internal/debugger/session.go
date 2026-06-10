@@ -386,7 +386,11 @@ func New(opts Options) (*Session, error) {
 				if info.CopyWorkdir == nil {
 					return nil
 				}
-				return info.CopyWorkdir(ctx)
+				// Mirror actions/checkout's `submodules:` input: it defaults to
+				// false (submodules are not fetched), and only `true`/`recursive`
+				// pull them in. So the local workspace copy skips submodule paths
+				// unless the step asked for them.
+				return info.CopyWorkdir(ctx, checkoutWantsSubmodules(info.Step))
 			}
 		}
 		interceptors = append(interceptors, stepInterceptor{name: "checkout", steps: checkouts, inject: inject})

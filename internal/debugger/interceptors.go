@@ -53,6 +53,20 @@ func isDefaultCheckout(st *model.Step) bool {
 	return true
 }
 
+// checkoutWantsSubmodules reports whether an actions/checkout step asked for its
+// git submodules, matching the action's own semantics: the `submodules:` input
+// defaults to false and only `true` or `recursive` fetch them. Anything else
+// (absent, "false", empty) leaves submodules out, so the local workspace copy
+// skips them too.
+func checkoutWantsSubmodules(st *model.Step) bool {
+	switch strings.ToLower(strings.TrimSpace(st.With["submodules"])) {
+	case "true", "recursive":
+		return true
+	default:
+		return false
+	}
+}
+
 // stepInterceptor neutralizes a class of steps that can't run faithfully on a local
 // runner (a default actions/checkout, a federated cloud-auth) and substitutes the
 // real local effect at the step's position. Built once in New; the barrier and the
