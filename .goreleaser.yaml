@@ -42,6 +42,7 @@ snapshot:
 
 changelog:
   sort: asc
+  abbrev: 7 # short commit hashes in the release notes, not full 40-char SHAs
   filters:
     exclude:
       - "^docs:"
