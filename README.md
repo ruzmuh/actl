@@ -5,7 +5,7 @@ locally — pause before any step, inspect the environment, drop into the job co
 re-run a step — with **faithful `uses:` execution**, because it stands on
 [`nektos/act`](https://github.com/nektos/act) instead of reimplementing the Actions engine.
 
-https://github.com/user-attachments/assets/586972ef-c879-4aff-b102-151f455c3263
+![actl: pause a workflow, drop into the live container, edit a step, and re-run it](https://github.com/user-attachments/assets/3fbdab29-72aa-405f-8b5b-79a0c7502ad8)
 
 ## What you get
 
