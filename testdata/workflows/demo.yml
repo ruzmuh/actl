@@ -1,0 +1,28 @@
+# Purpose-built for the README demo recording (demo/demo.tape).
+#
+# Flow it's designed to show:
+#   1. launch — paused BEFORE checkout (workspace empty, faithful to GitHub)
+#   2. step past the intercepted `actions/checkout` — actl copies your working
+#      tree into the workspace at the checkout step's position
+#   3. peek at the env inspector, then drop a shell into the live container and
+#      `ls -la` — you see your real repo (this is the actl repo itself)
+#   4. step onto `build`, edit its command, and re-run it in place — no git push
+#   5. continue to the end
+#
+# Run it from the repo root so the default -source is the actl working tree:
+#   actl testdata/workflows/demo.yml
+name: demo
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: build
+        run: echo "building actl"
+      - name: test
+        run: echo "running tests"
+      - name: done
+        run: echo "all green"

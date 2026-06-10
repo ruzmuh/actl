@@ -18,8 +18,16 @@
 .vars
 .vars.*
 
+# demo recordings — rendered media is hosted on GitHub (user-attachments CDN),
+# not committed; keep the binaries out of the repo. The .tape (recording script)
+# is text and may be committed for reproducibility.
+demo/*.gif
+demo/*.mp4
+demo/*.webm
+
 # editor / OS
 .DS_Store
 .idea/
 .vscode/
+.claude/
 CLAUDE.md

@@ -5,15 +5,34 @@ locally — pause before any step, inspect the environment, drop into the job co
 re-run a step — with **faithful `uses:` execution**, because it stands on
 [`nektos/act`](https://github.com/nektos/act) instead of reimplementing the Actions engine.
 
-> Status: pre-v0.1, under active development. Go. MIT. FOSS, no monetization.
->
-> Working today: single-job debugging through act's real engine — pause before/after
-> every step, env inspector, drop into the live job container, edit a step's command or
-> env and re-run it in place, breakpoints + run-to-cursor, job selection, matrix pinning,
-> isolated-run `needs` seeding, secrets / vars / env loading, a committable `.actl.yml`
-> config with per-environment overlays, `-list` inventory, GitHub & runtime-context
-> seeding, and ambient GCP **and AWS** identity substitution — each with a transparency
-> line.
+https://github.com/user-attachments/assets/586972ef-c879-4aff-b102-151f455c3263
+
+## What you get
+
+`actl` runs a real GitHub Actions job locally through act's engine and lets you **debug it
+like code** — instead of the push-and-pray loop of editing YAML and waiting on CI:
+
+- ⏸  **Pause before or after any step** — set breakpoints and run-to-cursor, or single-step
+  the whole job. Stop *before* anything runs, just like you can't on GitHub.
+- 🐚  **Drop into the live job container** mid-run — a real shell in the same container act
+  execs steps into, with the workspace and env exactly as the next step will see them.
+- 🔍  **Inspect the environment** at any pause — the job-scoped env the next step runs with.
+- ✏️  **Edit a step's command or env and re-run it in place** — no commit, no push, no
+  re-trigger.
+- 🎯  **Faithful `uses:`** — docker / composite / node actions run through act's *real*
+  engine, not a partial reimplementation.
+- 📥  **Faithful `actions/checkout`** — intercepted to copy your working tree (including
+  uncommitted changes) at the checkout step's position, so steps before it see an empty
+  workspace and steps after see your code, exactly as on GitHub.
+- ☁️  **Cloud identity, locally** — federated `gcp` and `aws` logins run under your ambient
+  `gcloud` / `aws` session so the auth step just works (Azure next).
+- 🧩  **Real-workflow ergonomics** — job selection, matrix pinning, `services:`, secrets /
+  vars / env, `needs` seeding, GitHub runtime-context seeding, per-`environment:` overlays,
+  a committable `.actl.yml`, and a Docker-free `-list` inventory.
+
+Every substitution actl makes prints a **transparency line** — it tells you exactly where
+local execution differs from CI (whose identity you're running as, what it seeded, what it
+mounted), so you're never silently testing something other than your workflow.
 
 ## Install
 
@@ -47,56 +66,61 @@ go install ./cmd/actl             # builds with the submodule on disk; binary la
 
 Requires Go (the module pins the toolchain to match act; `go` auto-fetches it).
 
-## Why
+## Quick start
 
-`act` runs Actions workflows locally and faithfully — but as a batch runner: it has no
-breakpoints, no pause-before-step, no drop-into-shell. `actl` adds that debug layer on top
-of `act`, so `uses:` (docker / composite / node actions) runs through act's real engine
-while you step through the job.
-
-## Architecture (short version)
-
-- **Reuse, don't rebuild.** `act/pkg/model` parses workflows; `act/pkg/exprparser`
-  evaluates `${{ }}`. Imported as-is.
-- **Soft fork for the pause hook.** act's per-step machinery is unexported, so a tiny patch
-  interleaves a *barrier* `common.Executor` between steps and exposes a resume channel on
-  `runner.Config`. The fork lives in [`third_party/act`](./third_party/act), wired in via a
-  `replace` directive in `go.mod`, pinned to a release. We keep the diff tiny and aim to
-  upstream the hook.
-- **Frontend-agnostic core.** The debug engine (`internal/debugger`) owns no terminal and
-  imports no frontend; the TUI is one consumer, with headless/agent and DAP front-ends as
-  future peers behind the same API.
-
-## Layout
-
-```
-cmd/actl/           TUI entry point
-cmd/spike-barrier/  line-based driver over the core (dev/debug aid)
-internal/debugger/  the pause-barrier core: Session, pause/step/continue, log capture
-internal/tui/       Bubble Tea front-end over the core
-internal/config/    loads .actl.yml (the debug slice: job/matrix/breakpoints/images/…)
-internal/workflow/  thin wrapper over act/pkg/model
-internal/expr/      thin wrapper over act/pkg/exprparser
-third_party/act/    soft fork of act — git submodule → ruzmuh/act (branch actl), pinned by SHA
-testdata/workflows/ sample workflows
-```
-
-## Develop
-
-Requires Go (the module pins the toolchain to match act; `go` auto-fetches it) and **Docker**
-(act starts a real job container and execs each step into it).
-
-The act fork lives in a submodule, so clone with `--recurse-submodules` (or run
-`git submodule update --init` afterwards):
+Run `actl` **from inside your repo**. With a single `.github/workflows/*.yml` it's picked up
+automatically; with several, pass the path. `actl` debugs **one job at a time**.
 
 ```sh
-git clone --recurse-submodules https://github.com/ruzmuh/actl
-go run ./cmd/actl                          # debug the sample workflow in the TUI
-go run ./cmd/actl path/to/workflow.yml     # your own workflow
-go run ./cmd/actl -image node:20-bullseye-slim   # smaller image for quick run-only workflows
+# look inside first — jobs, steps, matrix, environments (no Docker, no network):
+actl -list
+actl -list .github/workflows/ci.yml   # if you have more than one workflow
+
+# debug a job — pauses before the first step:
+actl -job build
+actl -job build .github/workflows/ci.yml
 ```
 
-`go test ./...` runs the tests (no Docker needed).
+In the TUI: `s` step · `c` continue · `d` drop into the container shell · `e` env pane ·
+`r` re-run the step · `q` quit ([full key list](#tui-keys)).
+
+**Need inputs, an event, secrets, or a pinned image?** Drop a committable **`.actl.yml`**
+next to your workflow instead of a wall of flags — `actl` auto-discovers it:
+
+```yaml
+# .actl.yml
+job: build
+event: workflow_dispatch
+inputs:                       # for workflow_dispatch / workflow_call
+  version: "1.2.3"
+secret-file: .secrets         # gitignored file; secrets can't be inlined here
+vars:
+  REGION: us-east-1
+```
+
+Now a bare `actl` uses it; any CLI flag still wins for a one-off override.
+
+**A few common scenarios:**
+
+```sh
+# a deploy job that depends on others — seed what upstream produced…
+actl -job deploy -need 'build.outputs.image=ghcr.io/acme/app:1.4.2'
+# …or run the upstream jobs for real, then debug deploy:
+actl -job deploy --with-deps
+
+# a job that logs into the cloud — your ambient gcloud / aws session is used automatically:
+actl -job deploy            # google-github-actions/auth & configure-aws-credentials just work
+
+# a matrix job — pin one combination (-list shows them):
+actl -job test -matrix 'os=ubuntu-latest' -matrix 'go=1.22'
+```
+
+Full detail on every flag and `.actl.yml` key is in [Usage](#usage) below.
+
+## Usage
+
+> Examples use the installed `actl` binary. Working from a clone instead? Swap `actl` for
+> `go run ./cmd/actl` (see [Develop](#develop)).
 
 ### TUI keys
 
@@ -114,7 +138,7 @@ the deployment `environment:` — and exits **without** running Docker or shelli
 identity. Use it to discover the job and step names you'll target.
 
 ```sh
-go run ./cmd/actl -list testdata/workflows/pipeline.yml
+actl -list testdata/workflows/pipeline.yml
 ```
 
 ### Selecting a job & seeding `needs`
@@ -124,11 +148,11 @@ run. Pick the job, and seed the upstream outputs/results you want it to see; the
 on the command line mean a re-run reproduces the exact state.
 
 ```sh
-go run ./cmd/actl testdata/workflows/pipeline.yml        # lists jobs if there's more than one
-go run ./cmd/actl -job deploy testdata/workflows/pipeline.yml
+actl testdata/workflows/pipeline.yml        # lists jobs if there's more than one
+actl -job deploy testdata/workflows/pipeline.yml
 
 # seed what the upstream job would have produced (paths mirror the needs.* context):
-go run ./cmd/actl -job deploy \
+actl -job deploy \
   -need 'build.outputs.image=ghcr.io/acme/app:1.4.2' \
   -need 'build.result=success' \
   -env  'STAGE=prod' \
@@ -144,7 +168,7 @@ upstream jobs for real to completion first, then pauses only on the target job's
 `needs.*` are genuine and there's nothing to seed (upstream output streams to the log pane):
 
 ```sh
-go run ./cmd/actl -job deploy --with-deps testdata/workflows/pipeline.yml
+actl -job deploy --with-deps testdata/workflows/pipeline.yml
 ```
 
 ### Matrix
@@ -153,7 +177,7 @@ A job whose `matrix` expands to more than one combination must be pinned to exac
 `-list` shows the combinations, and `-matrix KEY=VALUE` (repeatable) selects it:
 
 ```sh
-go run ./cmd/actl -job test \
+actl -job test \
   -matrix 'os=ubuntu-latest' -matrix 'go=1.22' \
   testdata/workflows/matrix.yml
 ```
@@ -175,10 +199,10 @@ files), or point at a file outside the repo with `-secret-file`/`-var-file`/`-en
 printf 'TOKEN=s3cr3t\n'     > .secrets   # gitignored
 printf 'REGION=eu-west-1\n' > .vars
 printf 'STAGE=dev\n'        > .env
-go run ./cmd/actl testdata/workflows/config.yml
+actl testdata/workflows/config.yml
 
 # keep secrets outside the repo and override one key for this run:
-go run ./cmd/actl -secret-file ~/.config/actl/demo.secrets \
+actl -secret-file ~/.config/actl/demo.secrets \
   -var 'REGION=us-east-1' testdata/workflows/config.yml
 ```
 
@@ -277,7 +301,7 @@ your working tree (build artifacts, generated files). The TUI shows a transparen
 a workspace is mounted.
 
 ```sh
-go run ./cmd/actl -workdir . path/to/workflow.yml
+actl -workdir . path/to/workflow.yml
 ```
 
 ### Checkout
@@ -286,11 +310,12 @@ A default `actions/checkout` (no `ref`/`repository`/`path`) would clone a remote
 workspace — losing your local changes. `actl` **intercepts** it: it copies your working tree
 (current dir, or `-source DIR`) into the workspace at the checkout step's position, honouring
 `.gitignore` and without mounting (no host writes). Steps before checkout still see an empty
-workspace, exactly as on GitHub; steps after see your code, including uncommitted changes. A
-checkout pinned to another repo/ref/path is left as a real clone.
+workspace, exactly as on GitHub; steps after see your code, including uncommitted changes.
+Git submodules follow the step's `submodules:` input (off by default, as on GitHub; `true`/
+`recursive` copies them in). A checkout pinned to another repo/ref/path is left as a real clone.
 
 ```sh
-go run ./cmd/actl testdata/workflows/checkout.yml
+actl testdata/workflows/checkout.yml
 ```
 
 ### Cloud identity (GCP & AWS)
@@ -308,7 +333,7 @@ under your own permissions, not the workflow's federated scope.
 
 ```sh
 gcloud auth application-default login        # once, so the ADC file exists
-go run ./cmd/actl testdata/workflows/gcp-auth.yml
+actl testdata/workflows/gcp-auth.yml
 ```
 
 It mounts your ADC file read-only into the container and sets
@@ -327,24 +352,53 @@ is injected when known. Disable with `-aws-identity=false` to leave the step unt
 
 ```sh
 aws sso login        # or any way your ambient credentials are established
-go run ./cmd/actl -aws-profile dev testdata/workflows/aws-auth.yml
+actl -aws-profile dev testdata/workflows/aws-auth.yml
 ```
 
 GCP and AWS are done; **Azure** is the remaining provider on the roadmap.
 
-## Roadmap
+## How it works
 
-Done so far: library spike ✓ → fork + pause barrier ✓ → frontend-agnostic core ✓ → TUI
-(step/inspect/shell/edit/re-run/breakpoints/run-to-cursor) ✓ → job selection + isolated
-`needs` seeding ✓ → run-dependencies-then-debug (`--with-deps`) ✓ → remote `uses:`
-(node / docker / composite) ✓ → workspace mount for local actions (`-workdir`) ✓ →
-faithful `actions/checkout` (copies your local working tree) ✓ → secrets / vars / env from
-act's dotenv triple ✓ → matrix selection + services line ✓ → `.actl.yml` config + `-list`
-inventory ✓ → per-environment overlays ✓ → GitHub & runtime-context seeding ✓ → ambient
-GCP and AWS identity substitution ✓.
+`act` already runs Actions workflows locally — but as a batch runner: no breakpoints, no
+pause-before-step, no drop-into-shell. `actl` adds exactly that debug layer, then stays out
+of the way of act's engine:
 
-Next: Azure identity → full multi-job graph → high-fidelity OIDC → headless / agent mode →
-upstream the hook(s).
+- **Reuse, don't rebuild.** `act/pkg/model` parses workflows; `act/pkg/exprparser`
+  evaluates `${{ }}`. Imported as-is.
+- **Soft fork for the pause hook.** act's per-step machinery is unexported, so a tiny patch
+  interleaves a *barrier* `common.Executor` between steps and exposes a resume channel on
+  `runner.Config`. The fork lives in [`third_party/act`](./third_party/act), wired in via a
+  `replace` directive in `go.mod`, pinned to a release. We keep the diff tiny and aim to
+  upstream the hook.
+- **Frontend-agnostic core.** The debug engine (`internal/debugger`) owns no terminal and
+  imports no frontend; the TUI is one consumer, with headless/agent and DAP front-ends as
+  future peers behind the same API.
+
+### Layout
+
+```
+cmd/actl/           TUI entry point
+internal/debugger/  the pause-barrier core: Session, pause/step/continue, log capture
+internal/tui/       Bubble Tea front-end over the core
+internal/config/    loads .actl.yml (the debug slice: job/matrix/breakpoints/images/…)
+internal/workflow/  thin wrapper over act/pkg/model
+third_party/act/    soft fork of act — git submodule → ruzmuh/act (branch actl), pinned by SHA
+testdata/workflows/ sample workflows
+```
+
+## Develop
+
+Requires Go (the module pins the toolchain to match act; `go` auto-fetches it) and **Docker**
+(act starts a real job container and execs each step into it). The act fork is a git
+submodule, so clone with `--recurse-submodules` (or run `git submodule update --init`):
+
+```sh
+git clone --recurse-submodules https://github.com/ruzmuh/actl
+cd actl
+go run ./cmd/actl                          # debug the sample workflow in the TUI
+go run ./cmd/actl path/to/workflow.yml     # your own workflow
+go test ./...                              # run the tests (no Docker needed)
+```
 
 ## License
 
