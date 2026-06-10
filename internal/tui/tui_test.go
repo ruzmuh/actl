@@ -110,6 +110,83 @@ func TestModelFlow(t *testing.T) {
 	}
 }
 
+// TestProgressFollowsRun guards the Continue-mode step tracking: progress events
+// advance the running-step highlight, a straggler progress while paused is ignored
+// (must not drag the highlight backward), and a clean finish marks the whole list
+// done even though Continue-to-end fires no pause. This is the fix for the step list
+// staying stuck on step 1 after Continue.
+func TestProgressFollowsRun(t *testing.T) {
+	sess, err := debugger.New(debugger.Options{
+		WorkflowPath: "../../testdata/workflows/sample.yml",
+		Workdir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var m tea.Model = New(sess, func() {}) // starts in stateRunning, cur == -1
+
+	// progress while running advances the highlight to the running step
+	m, _ = m.Update(progressMsg(debugger.ProgressEvent{Index: 0}))
+	m, _ = m.Update(progressMsg(debugger.ProgressEvent{Index: 1}))
+	if mm := m.(Model); mm.cur != 1 {
+		t.Fatalf("cur after progress = %d, want 1", mm.cur)
+	}
+	if got := m.View(); !strings.Contains(got, "running") {
+		t.Errorf("running highlight missing while progressing:\n%s", got)
+	}
+
+	// pause at step 3 (index 2) — now paused, highlight on that step
+	m, _ = m.Update(pauseMsg(debugger.PauseEvent{When: debugger.Before, Index: 2}))
+	if mm := m.(Model); mm.cur != 2 {
+		t.Fatalf("cur after pause = %d, want 2", mm.cur)
+	}
+
+	// a straggler progress for an earlier step arriving while paused is ignored
+	m, _ = m.Update(progressMsg(debugger.ProgressEvent{Index: 1}))
+	if mm := m.(Model); mm.cur != 2 {
+		t.Errorf("paused highlight moved backward to %d on straggler progress, want 2", mm.cur)
+	}
+
+	// Continue to the end: a clean finish marks the whole list done (cur == last)
+	m, _ = m.Update(doneMsg{})
+	if mm := m.(Model); mm.cur != len(mm.labels)-1 {
+		t.Errorf("cur after clean finish = %d, want last step %d", mm.cur, len(mm.labels)-1)
+	}
+	if got := m.View(); !strings.Contains(got, "run complete") {
+		t.Errorf("done view missing 'run complete':\n%s", got)
+	}
+}
+
+// TestProgressFinishWithError keeps the failed-run case honest: a finish carrying an
+// error leaves the highlight where execution stopped (steps after it never ran), so
+// the list must NOT jump to the last step.
+func TestProgressFinishWithError(t *testing.T) {
+	sess, err := debugger.New(debugger.Options{
+		WorkflowPath: "../../testdata/workflows/sample.yml",
+		Workdir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var m tea.Model = New(sess, func() {})
+	m, _ = m.Update(progressMsg(debugger.ProgressEvent{Index: 2}))
+	m, _ = m.Update(doneMsg{err: errFailed})
+	if mm := m.(Model); mm.cur != 2 {
+		t.Errorf("cur after failed finish = %d, want 2 (where it stopped)", mm.cur)
+	}
+	if got := m.View(); !strings.Contains(got, "run failed") {
+		t.Errorf("failed view missing 'run failed':\n%s", got)
+	}
+}
+
+var errFailed = errTest("boom")
+
+type errTest string
+
+func (e errTest) Error() string { return string(e) }
+
 // TestLogScroll drives the scrollable LOGS pane: it follows the tail while at
 // the bottom, PgUp parks it on earlier output (no longer at bottom), and End
 // returns it to the tail.

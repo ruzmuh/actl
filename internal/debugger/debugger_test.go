@@ -827,6 +827,41 @@ func TestShouldHaltPolicy(t *testing.T) {
 	}
 }
 
+// TestEmitProgress: progress is advisory and emitted only for the debugged job's
+// "before" boundaries; After boundaries and other jobs (--with-deps) don't fire it,
+// and a full buffer drops silently rather than blocking the act goroutine.
+func TestEmitProgress(t *testing.T) {
+	s := &Session{jobID: "build", progress: make(chan ProgressEvent, 2)}
+	info := func(w runner.BarrierWhen, job string, idx int) runner.StepBarrierInfo {
+		return runner.StepBarrierInfo{When: w, JobID: job, Index: idx}
+	}
+
+	// before-boundary on the debugged job → one event with the right index
+	s.emitProgress(info(runner.BarrierBefore, "build", 3))
+	select {
+	case ev := <-s.progress:
+		if ev.Index != 3 {
+			t.Errorf("progress index = %d, want 3", ev.Index)
+		}
+	default:
+		t.Fatal("expected a progress event for the before boundary")
+	}
+
+	// after-boundary and a different job emit nothing
+	s.emitProgress(info(runner.BarrierAfter, "build", 3))
+	s.emitProgress(info(runner.BarrierBefore, "deploy", 0))
+	select {
+	case ev := <-s.progress:
+		t.Errorf("unexpected progress event: %+v", ev)
+	default:
+	}
+
+	// a full buffer drops without blocking
+	s.emitProgress(info(runner.BarrierBefore, "build", 0))
+	s.emitProgress(info(runner.BarrierBefore, "build", 1))
+	s.emitProgress(info(runner.BarrierBefore, "build", 2)) // buffer full → dropped, must not block
+}
+
 // TestResolveToken: an explicit token wins; otherwise a GITHUB_TOKEN secret is
 // used and mirrored so github.token and secrets.GITHUB_TOKEN stay equal; absent
 // yields an empty, not-present summary.

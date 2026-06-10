@@ -31,6 +31,7 @@ const (
 // messages bridging the core's channels into the Bubble Tea event loop.
 type (
 	pauseMsg     debugger.PauseEvent
+	progressMsg  debugger.ProgressEvent
 	logMsg       string
 	logsDoneMsg  struct{}
 	doneMsg      struct{ err error }
@@ -373,7 +374,7 @@ func ghcLine(g debugger.GitHubContextSummary) string {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.waitPause, m.waitLog, m.waitDone)
+	return tea.Batch(m.waitPause, m.waitProgress, m.waitLog, m.waitDone)
 }
 
 // --- commands (read the core's channels, return a Msg) ---
@@ -384,6 +385,19 @@ func (m Model) waitPause() tea.Msg {
 		return pauseMsg(ev)
 	case <-m.sess.Done():
 		return nil // run ended; no more pauses
+	}
+}
+
+// waitProgress reads one advisory step-progress event so the step list can track
+// the running step in Continue mode. It runs alongside waitPause for the life of the
+// run and stops when the run is done. Progress is lossy by design; missing one only
+// delays the highlight until the next event or the final doneMsg.
+func (m Model) waitProgress() tea.Msg {
+	select {
+	case ev := <-m.sess.Progress():
+		return progressMsg(ev)
+	case <-m.sess.Done():
+		return nil // run ended; no more progress
 	}
 }
 
@@ -536,6 +550,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cursor = msg.Index // focus the step we stopped at; edit/env/rerun target it
 		return m, nil
 
+	case progressMsg:
+		// Advisory: advance the running-step highlight only while actually running.
+		// While paused we ignore it — a straggler from before the halt (the two
+		// channels aren't ordered) must not drag m.cur backward off the paused step.
+		if m.state == stateRunning {
+			m.cur = msg.Index
+		}
+		return m, m.waitProgress
+
 	case logMsg:
 		m.appendLog(string(msg))
 		return m, m.waitLog
@@ -562,6 +585,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case doneMsg:
 		m.state = stateFinished
 		m.runErr = msg.err
+		// On a clean finish every step ran: advance the highlight to the last step so
+		// the whole list renders as done (Continue-to-end emits no pause, and a
+		// dropped final progress hint could otherwise leave m.cur stuck mid-list). On
+		// failure we leave m.cur where execution stopped — steps after it never ran.
+		if msg.err == nil && len(m.labels) > 0 {
+			m.cur = len(m.labels) - 1
+		}
 		return m, nil
 	}
 	return m, nil

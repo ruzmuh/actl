@@ -299,6 +299,16 @@ type PauseEvent struct {
 	Err   error       // for When==After: the step's error, or nil
 }
 
+// ProgressEvent is emitted as the run passes a step's "before" boundary without
+// halting (Continue mode, no breakpoint), so a frontend can follow execution — the
+// step-list highlight tracks the running step even when no pause fires. It's purely
+// advisory: the send is non-blocking and may be dropped under load, and the
+// authoritative state is still PauseEvent/Done. Emitted only for the debugged job.
+type ProgressEvent struct {
+	Index int         // zero-based step index now starting
+	Step  *model.Step // the step at this boundary
+}
+
 // mode is the run policy consulted at each barrier.
 type mode int
 
@@ -337,11 +347,12 @@ type Session struct {
 	tmpDir          string // non-empty if we created (and must clean up) the workdir
 	eventFile       string // non-empty if we wrote (and must clean up) a merged event.json
 
-	pauses  chan PauseEvent
-	resume  chan control
-	logs    chan string
-	factory *logFactory
-	done    chan struct{}
+	pauses   chan PauseEvent
+	progress chan ProgressEvent // advisory step-progress for Continue mode (buffered, lossy)
+	resume   chan control
+	logs     chan string
+	factory  *logFactory
+	done     chan struct{}
 
 	mu           sync.Mutex
 	curMode      mode
@@ -561,6 +572,7 @@ func New(opts Options) (*Session, error) {
 		tmpDir:          tmpDir,
 		eventFile:       eventFile,
 		pauses:          make(chan PauseEvent),
+		progress:        make(chan ProgressEvent, 256), // lossy: a slow frontend drops, never blocks act
 		resume:          make(chan control),
 		logs:            make(chan string, 1024),
 		done:            make(chan struct{}),
@@ -723,6 +735,12 @@ func (s *Session) Logs() <-chan string { return s.logs }
 // until a control method (Step/Continue/Abort) is called.
 func (s *Session) Pauses() <-chan PauseEvent { return s.pauses }
 
+// Progress delivers an advisory ProgressEvent as each step starts while the run is
+// passing through (Continue mode), letting a frontend track the running step without
+// a halt. The channel is buffered and lossy — the run never blocks on it — so it's a
+// hint, not a guarantee; Pauses/Done remain authoritative. Optional to consume.
+func (s *Session) Progress() <-chan ProgressEvent { return s.progress }
+
 // Done is closed when the run has finished (successfully, with an error, or
 // aborted). Read Err afterwards.
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -783,6 +801,9 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 	}
 
 	if !s.shouldHalt(info) {
+		// Not halting — advertise progress so a frontend can follow the run in
+		// Continue mode (the step highlight tracks execution even with no pause).
+		s.emitProgress(info)
 		return nil
 	}
 
@@ -820,6 +841,24 @@ func (s *Session) barrier(ctx context.Context, info runner.StepBarrierInfo) erro
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// emitProgress publishes an advisory ProgressEvent as a step starts, so a frontend
+// can follow Continue-mode execution. Only the debugged job's "before" boundaries
+// count (the After boundary doesn't move the highlight; --with-deps upstream jobs are
+// not the focus). The send is non-blocking — act must never wait on a frontend — so a
+// full buffer just drops the hint; Pauses/Done keep the display correct regardless.
+func (s *Session) emitProgress(info runner.StepBarrierInfo) {
+	if info.When != runner.BarrierBefore {
+		return
+	}
+	if info.JobID != "" && info.JobID != s.jobID {
+		return
+	}
+	select {
+	case s.progress <- ProgressEvent{Index: info.Index, Step: info.Step}:
+	default:
 	}
 }
 
