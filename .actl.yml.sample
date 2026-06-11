@@ -55,3 +55,15 @@ inputs:
 #     result: success
 #     outputs:
 #       sha: abc123
+
+# --- cloud identity ---
+# Default is bring-a-credential: a federated auth step (WIF / OIDC / role-to-assume) is
+# rewritten to its secret/key mode using a credential YOU supply, then the REAL login
+# action runs. `file:` is read relative to the working dir (or an absolute path; `~` is
+# NOT expanded here). Name it `.secrets.<cloud>.*` so .gitignore (.secrets.*) keeps it
+# out of git. `ambient: true` is the opt-in personal-login fallback (GCP/AWS only).
+# identity:
+#   gcp:   { file: .secrets.gcp.json }    # google-github-actions/auth -> credentials_json
+#   aws:   { file: .secrets.aws.env }     # configure-aws-credentials -> static keys
+#   azure: { file: .secrets.azure.json }  # azure/login -> creds
+#   # gcp: { ambient: true }              # use your gcloud ADC instead (mounts a refresh token)

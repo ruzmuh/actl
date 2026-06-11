@@ -248,6 +248,12 @@ inputs:                                  # workflow_dispatch / workflow_call
 #   lint:
 #     result: success
 #     outputs: { sha: abc123 }
+
+identity:                                # cloud auth — bring a scoped credential
+  gcp:   { file: .secrets.gcp.json }     # SA key → rewrites a federated google-github-actions/auth
+  aws:   { file: .secrets.aws.env }      # AWS_ACCESS_KEY_ID/SECRET dotenv → static-key rewrite
+  azure: { file: .secrets.azure.json }   # SP creds → rewrites a federated azure/login
+  # gcp: { ambient: true }               # opt-in instead: use your gcloud ADC (GCP/AWS only)
 ```
 
 Because `.actl.yml` is committable, **secrets can't be inlined** — an inline `secrets:`
@@ -368,8 +374,34 @@ A creds-mode `azure/login` (legacy `creds:` input) runs untouched — just put t
 refresh-token credential). AWS and Azure need the cloud CLI in the runner image, e.g.
 `catthehacker/ubuntu:full-latest`.
 
+#### Federated workflow + a key you already have → put it in `.actl.yml`
+
+The common case: the workflow is written for OIDC federation, but you hold a key/secret for
+that identity (or a scoped debug one). Drop the credential file next to the repo and point
+`.actl.yml` at it — then a plain `actl` rewrites the federated step and runs the real action,
+no per-run flags:
+
+```yaml
+# .actl.yml
+identity:
+  gcp:   { file: .secrets.gcp.json }     # google-github-actions/auth → credentials_json
+  aws:   { file: .secrets.aws.env }      # configure-aws-credentials → static keys
+  azure: { file: .secrets.azure.json }   # azure/login → creds
+```
+
+```sh
+actl -job deploy            # the federated auth step is rewritten from the configured key
+```
+
+Keep the credential file **out of git**: naming it `.secrets.<cloud>.json` is enough — the
+repo's `.gitignore` already covers `.secrets.*`. The `file:` path is read relative to the
+working dir (an absolute path also works; `~` is **not** expanded in YAML — that only happens
+for a shell-passed `-…-file` flag). `actl` loads the file into a reserved secret that act
+masks in logs, and references it from the rewritten step. (Equivalent flags for one-off runs:
+`-gcp-key-file` / `-aws-keys-file` / `-azure-creds-file`.)
+
 > The deprecated `-gcp-identity` / `-aws-identity` flags now alias `-gcp-ambient` /
-> `-aws-ambient`. Per-cloud config lives under `.actl.yml` `identity:`.
+> `-aws-ambient`.
 
 ## How it works
 

@@ -18,6 +18,10 @@
 .vars
 .vars.*
 
+# cloud credentials: the file google-github-actions/auth writes into the workspace,
+# and any brought key/creds file you point identity:.file at — never commit these
+gha-creds-*.json
+
 # demo recordings — rendered media is hosted on GitHub (user-attachments CDN),
 # not committed; keep the binaries out of the repo. The .tape (recording script)
 # is text and may be committed for reproducibility.
