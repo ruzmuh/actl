@@ -637,7 +637,7 @@ var (
 // and the log/env pane absorbs whatever height is left. Nothing word-wraps, so
 // every element's row count is fixed and the total never overflows the terminal.
 const (
-	maxNoticeRows = 6
+	maxNoticeRows = 8
 	maxStepRows   = 10
 	// footerRows is fixed so the height budget doesn't depend on run state: the
 	// footer is two rows when paused (status + keybar) and one otherwise, and the
