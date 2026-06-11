@@ -1,0 +1,25 @@
+# Demonstrates the secret/key-mode path for GCP: a google-github-actions/auth that
+# already uses a service-account key (credentials_json) authenticates WITHOUT GitHub
+# OIDC, so it runs faithfully on a local runner with ZERO interception — actl leaves
+# the step untouched and the real action runs. Just supply the secret it references:
+#
+#   echo "GCP_SA_KEY=$(cat ~/sa-key.json)" >> .secrets
+#   go run ./cmd/actl -var GCP_PROJECT=your-project testdata/workflows/gcp-auth-key.yml
+#
+# The TUI's transparency line says the step "runs as declared". For the federated (WIF)
+# variant — where actl substitutes a brought key by default — see gcp-auth.yml.
+name: gcp-auth-key
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: read-only call
+        run: gcloud storage buckets list --project "${{ vars.GCP_PROJECT }}"

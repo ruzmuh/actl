@@ -24,8 +24,8 @@ like code** — instead of the push-and-pray loop of editing YAML and waiting on
 - 📥  **Faithful `actions/checkout`** — intercepted to copy your working tree (including
   uncommitted changes) at the checkout step's position, so steps before it see an empty
   workspace and steps after see your code, exactly as on GitHub.
-- ☁️  **Cloud identity, locally** — federated `gcp` and `aws` logins run under your ambient
-  `gcloud` / `aws` session so the auth step just works (Azure next).
+- ☁️  **Cloud identity, locally** — federated `gcp`, `aws` and `azure` logins are rewritten
+  to run the real login action under a scoped credential you bring, so the auth step just works.
 - 🧩  **Real-workflow ergonomics** — job selection, matrix pinning, `services:`, secrets /
   vars / env, `needs` seeding, GitHub runtime-context seeding, per-`environment:` overlays,
   a committable `.actl.yml`, and a Docker-free `-list` inventory.
@@ -108,8 +108,8 @@ actl -job deploy -need 'build.outputs.image=ghcr.io/acme/app:1.4.2'
 # …or run the upstream jobs for real, then debug deploy:
 actl -job deploy --with-deps
 
-# a job that logs into the cloud — your ambient gcloud / aws session is used automatically:
-actl -job deploy            # google-github-actions/auth & configure-aws-credentials just work
+# a job that logs into the cloud — bring a scoped credential, the real login action runs:
+actl -job deploy -gcp-key-file ~/sa-key.json   # rewrites the federated auth step, faithfully
 
 # a matrix job — pin one combination (-list shows them):
 actl -job test -matrix 'os=ubuntu-latest' -matrix 'go=1.22'
@@ -318,44 +318,58 @@ Git submodules follow the step's `submodules:` input (off by default, as on GitH
 actl testdata/workflows/checkout.yml
 ```
 
-### Cloud identity (GCP & AWS)
+### Cloud identity (GCP, AWS & Azure)
 
-In real CI, a login action (`google-github-actions/auth`, `aws-actions/configure-aws-credentials`)
-plus `id-token: write` mints a GitHub-signed OIDC token and exchanges it for short-lived
-cloud credentials. **Locally there is no GitHub OIDC issuer**, so that step can't federate —
-it would fail and kill the job. `actl` **intercepts** it: rewrites it to a no-op and injects
-your *ambient* credentials, so later steps run as **you**. The TUI prints a transparency line
-— what the step *would* federate as vs the local identity it runs as — because you're testing
-under your own permissions, not the workflow's federated scope.
+In real CI, a login action (`google-github-actions/auth`, `aws-actions/configure-aws-credentials`,
+`azure/login`) plus `id-token: write` mints a GitHub-signed OIDC token and exchanges it for
+short-lived cloud credentials. **Locally there is no GitHub OIDC issuer**, so a *federated*
+step can't authenticate — it would fail and kill the job.
 
-**GCP** — `actl` injects your gcloud Application Default Credentials so later steps
-(`gcloud`/`gsutil`, `setup-gcloud`, client libraries, terraform) run as you:
+`actl`'s default is **bring a scoped credential**: you supply a service-account key /
+service-principal secret / static keys, and `actl` rewrites the federated step to its
+secret/key mode (referencing the credential as a masked secret) and **runs the real login
+action** — so it authenticates faithfully, under a real non-personal identity whose actual
+permissions are exercised. A step that *already* uses secret/key mode runs untouched. The
+TUI prints a transparency line for each — what it would federate as vs how `actl` satisfied
+it. (An *opt-in* ambient fallback runs steps under your personal login instead; see below.)
 
-```sh
-gcloud auth application-default login        # once, so the ADC file exists
-actl testdata/workflows/gcp-auth.yml
-```
-
-It mounts your ADC file read-only into the container and sets
-`GOOGLE_APPLICATION_CREDENTIALS` (so client libraries and terraform discover it) plus
-`CLOUDSDK_AUTH_ACCESS_TOKEN` (so gcloud/gsutil and `setup-gcloud` authenticate). Point
-at a specific credential file with `-gcp-credentials FILE`, or leave the auth step
-untouched (real federation) with `-gcp-identity=false`. The access token lives ~1h; the
-credential file keeps client libraries working past that. `actl` doesn't inject a
-**project** — that's the workflow's concern, exactly as on GitHub (the command's
-`--project`, or a `GOOGLE_CLOUD_PROJECT` you pass via `.env` / `-env`). A `gcloud` call
-with no project resolved fails the same way it would in CI (*"Project id: 0 is invalid"*).
-
-**AWS** — same shape: `actl` injects your ambient AWS credentials (env-only, no file
-mount), resolved from the default profile / environment or `-aws-profile NAME`; the region
-is injected when known. Disable with `-aws-identity=false` to leave the step untouched.
+**GCP** — bring a service-account key for the federated `google-github-actions/auth`:
 
 ```sh
-aws sso login        # or any way your ambient credentials are established
-actl -aws-profile dev testdata/workflows/aws-auth.yml
+actl -gcp-key-file ~/sa-key.json testdata/workflows/gcp-auth.yml
 ```
 
-GCP and AWS are done; **Azure** is the remaining provider on the roadmap.
+`actl` doesn't inject a **project** — that's the workflow's concern, exactly as on GitHub
+(the command's `--project`, or a `GOOGLE_CLOUD_PROJECT` you pass via `.env` / `-env`).
+*Opt-in ambient fallback:* `-gcp-ambient` mounts your gcloud Application Default Credentials
+(`gcloud auth application-default login` first; `-gcp-credentials FILE` to point elsewhere)
+and injects them — note this puts a re-mintable refresh-token credential in the container.
+
+**AWS** — bring static keys (a dotenv with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`)
+for the federated `aws-actions/configure-aws-credentials`; the declared `aws-region` is kept:
+
+```sh
+actl -aws-keys-file ~/aws-debug.env -image catthehacker/ubuntu:full-latest testdata/workflows/aws-auth.yml
+```
+
+Credentials are used directly (no `sts:AssumeRole` — the CI role's trust policy won't trust
+your principal). *Opt-in ambient fallback:* `-aws-ambient` (with `-aws-profile NAME`) injects
+your ambient AWS session (env-only).
+
+**Azure** — bring a service-principal creds JSON (`az ad sp create-for-rbac --json`) for the
+federated `azure/login`; `actl` rewrites it to `creds` mode and runs the real action:
+
+```sh
+actl -azure-creds-file ~/azure-sp.json -image catthehacker/ubuntu:full-latest testdata/workflows/azure-auth.yml
+```
+
+A creds-mode `azure/login` (legacy `creds:` input) runs untouched — just put the secret in
+`.secrets`. **Azure has no ambient fallback** (it would require mounting your `~/.azure`
+refresh-token credential). AWS and Azure need the cloud CLI in the runner image, e.g.
+`catthehacker/ubuntu:full-latest`.
+
+> The deprecated `-gcp-identity` / `-aws-identity` flags now alias `-gcp-ambient` /
+> `-aws-ambient`. Per-cloud config lives under `.actl.yml` `identity:`.
 
 ## How it works
 

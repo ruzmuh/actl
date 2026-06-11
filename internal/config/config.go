@@ -38,6 +38,23 @@ type Config struct {
 	Environments map[string]EnvOverlay `yaml:"environments"`
 	Inputs       map[string]string     `yaml:"inputs"`
 	Needs        map[string]Need       `yaml:"needs"`
+	Identity     Identity              `yaml:"identity"`
+}
+
+// Identity configures cloud identity handling per cloud (CLAUDE.md §4). The default path
+// is bring-a-credential (File); ambient personal login is an opt-in fallback (GCP/AWS
+// only — Azure has no ambient mode, so its Ambient is ignored).
+type Identity struct {
+	GCP   CloudIdentity `yaml:"gcp"`
+	AWS   CloudIdentity `yaml:"aws"`
+	Azure CloudIdentity `yaml:"azure"`
+}
+
+// CloudIdentity is one cloud's identity config: a brought-credential file (GCP SA key
+// JSON / Azure SP creds JSON / AWS keys dotenv) and an opt-in ambient flag (GCP/AWS).
+type CloudIdentity struct {
+	File    string `yaml:"file"`    // path to the brought credential (kept out of git, like secret-file)
+	Ambient *bool  `yaml:"ambient"` // opt-in ambient fallback; nil = unset (GCP/AWS only)
 }
 
 // EnvOverlay is a per-`environment:` overlay of secrets/vars on top of the flat

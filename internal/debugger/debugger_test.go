@@ -527,59 +527,120 @@ jobs:
 	}
 }
 
-// TestInterceptGCPAuth covers detection + rewrite of google-github-actions/auth:
-// the step becomes a no-op run (so it can't federate), keeps a visible label, and
-// its declared federation target is captured before With is cleared.
-func TestInterceptGCPAuth(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gcp.yml")
-	const wf = `name: gcp
-on: push
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - id: auth
-        uses: google-github-actions/auth@v2
-        with:
-          service_account: sa@proj.iam.gserviceaccount.com
-          workload_identity_provider: projects/1/locations/global/workloadIdentityPools/p/providers/x
-      - run: gcloud projects describe proj
-`
-	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
-		t.Fatal(err)
+// gcpWIFSteps returns a two-step slice whose first step is a federated (WIF)
+// google-github-actions/auth, for the GCP identity-builder tests.
+func gcpWIFSteps() []*model.Step {
+	return []*model.Step{
+		{ID: "auth", Uses: "google-github-actions/auth@v2", With: map[string]string{
+			"service_account":            "sa@proj.iam.gserviceaccount.com",
+			"workload_identity_provider": "projects/1/locations/global/workloadIdentityPools/p/providers/x",
+		}},
+		{Run: "gcloud projects describe proj"},
 	}
-	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir(),
-		GCP: &GCPIdentity{CredentialFile: "/tmp/adc.json", AccessToken: "ya29.x", Account: "me@example.com"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// auth step (0) -> no-op run, recorded
-	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
-		t.Errorf("auth step not rewritten: Uses=%q Run=%q", got.Uses, got.Run)
-	}
-	sum := s.GCPSummary()
-	if len(sum.Steps) != 1 || sum.Steps[0] != "google-github-actions/auth@v2" {
-		t.Errorf("GCPSummary.Steps = %v, want [google-github-actions/auth@v2]", sum.Steps)
-	}
-	want := "sa@proj.iam.gserviceaccount.com via projects/1/locations/global/workloadIdentityPools/p/providers/x"
-	if len(sum.Targets) != 1 || sum.Targets[0] != want {
-		t.Errorf("GCPSummary.Targets = %v, want [%q]", sum.Targets, want)
-	}
-	if !sum.File || !sum.Token || sum.Account != "me@example.com" {
-		t.Errorf("GCPSummary = %+v, want File+Token+account", sum)
-	}
-
-	// the credential bind that act mounts into the job container.
-	if got := gcpBind(&GCPIdentity{CredentialFile: "/tmp/adc.json"}, true); !strings.Contains(got, "/tmp/adc.json:"+gcpCredsContainerPath+":ro") {
-		t.Errorf("gcpBind = %q, want the ro credential bind", got)
-	}
-	// (the env injected at the auth step's position is asserted in TestBuildGCP.)
 }
 
-// TestGCPNoIdentity: an auth step with no ambient credentials is still neutralized
-// (so the job survives), but nothing is injected and the summary says so.
-func TestGCPNoIdentity(t *testing.T) {
+const gcpWIFTarget = "sa@proj.iam.gserviceaccount.com via projects/1/locations/global/workloadIdentityPools/p/providers/x"
+
+// TestGCPSubstitute covers the default bring-a-credential path: a brought SA key rewrites
+// the federated step to credentials_json mode (the real action keeps running), registers
+// the masked reserved secret, and needs no barrier interceptor.
+func TestGCPSubstitute(t *testing.T) {
+	steps := gcpWIFSteps()
+	key := `{"type":"service_account","client_email":"ci@proj.iam.gserviceaccount.com"}`
+	itc, secrets, sum := buildGCPIdentity(steps, key, nil)
+
+	if steps[0].Uses == "" {
+		t.Error("substitute must keep Uses so the real action runs")
+	}
+	if steps[0].With["credentials_json"] != "${{ secrets."+gcpKeySecret+" }}" {
+		t.Errorf("credentials_json = %q, want the masked secret expr", steps[0].With["credentials_json"])
+	}
+	if steps[0].With["workload_identity_provider"] != "" || steps[0].With["service_account"] != "" {
+		t.Errorf("WIF inputs not cleared: %v", steps[0].With)
+	}
+	if secrets[gcpKeySecret] != key {
+		t.Errorf("reserved secret = %q, want the key JSON", secrets[gcpKeySecret])
+	}
+	if sum.Mode != AuthSubstituted || len(sum.Steps) != 1 || sum.Targets[0] != gcpWIFTarget {
+		t.Errorf("summary = %+v, want substituted with the WIF target", sum)
+	}
+	if sum.Account != "ci@proj.iam.gserviceaccount.com" {
+		t.Errorf("Account = %q, want the SA client_email", sum.Account)
+	}
+	if len(itc.steps) != 0 {
+		t.Error("substitute needs no barrier interceptor — the real action runs")
+	}
+}
+
+// TestGCPAmbient covers the opt-in fallback: the federated step is neutralized and the
+// ambient credentials are injected at its position with the ADC mount.
+func TestGCPAmbient(t *testing.T) {
+	steps := gcpWIFSteps()
+	itc, secrets, sum := buildGCPIdentity(steps, "", &GCPIdentity{CredentialFile: "/tmp/adc.json", AccessToken: "ya29.x", Account: "me@example.com"})
+
+	if steps[0].Uses != "" || steps[0].Run == "" {
+		t.Errorf("ambient should neutralize the step: Uses=%q Run=%q", steps[0].Uses, steps[0].Run)
+	}
+	if secrets != nil {
+		t.Errorf("ambient registers no reserved secret, got %v", secrets)
+	}
+	if sum.Mode != AuthAmbient || !sum.File || !sum.Token || sum.Account != "me@example.com" {
+		t.Errorf("summary = %+v, want ambient with file+token+account", sum)
+	}
+	if !itc.steps[0] || itc.inject == nil {
+		t.Error("ambient needs a barrier interceptor injecting env")
+	}
+	if !strings.Contains(itc.container, "/tmp/adc.json:"+gcpCredsContainerPath+":ro") {
+		t.Errorf("container = %q, want the ro ADC bind", itc.container)
+	}
+}
+
+// TestGCPDeclaredSkipped: a credentials_json (key-mode) step runs untouched even when a
+// brought key is configured — it already authenticates faithfully.
+func TestGCPDeclaredSkipped(t *testing.T) {
+	steps := []*model.Step{
+		{Uses: "google-github-actions/auth@v2", With: map[string]string{"credentials_json": "${{ secrets.SA }}"}},
+		{Run: "echo hi"},
+	}
+	itc, secrets, sum := buildGCPIdentity(steps, `{"client_email":"x"}`, nil)
+	if steps[0].Uses == "" || steps[0].With["credentials_json"] != "${{ secrets.SA }}" {
+		t.Errorf("key-mode step must run untouched: %+v", steps[0])
+	}
+	if sum.Mode != AuthDeclared || len(sum.Declared) != 1 || len(sum.Steps) != 0 {
+		t.Errorf("summary = %+v, want declared (untouched)", sum)
+	}
+	if secrets != nil || len(itc.steps) != 0 {
+		t.Errorf("declared path registers nothing: secrets=%v itc=%v", secrets, itc.steps)
+	}
+}
+
+// TestGCPUnsatisfied: a federated step with neither a brought key nor ambient is
+// neutralized so the job survives, and the summary says cloud calls will fail.
+func TestGCPUnsatisfied(t *testing.T) {
+	steps := gcpWIFSteps()
+	itc, secrets, sum := buildGCPIdentity(steps, "", nil)
+	if steps[0].Uses != "" {
+		t.Errorf("federated step with no credential must be neutralized: Uses=%q", steps[0].Uses)
+	}
+	if sum.Mode != AuthUnsatisfied || len(sum.Steps) != 1 {
+		t.Errorf("summary = %+v, want unsatisfied", sum)
+	}
+	if secrets != nil || len(itc.steps) != 0 {
+		t.Errorf("unsatisfied registers nothing: secrets=%v itc=%v", secrets, itc.steps)
+	}
+}
+
+// TestGCPNoAuth: a job with no google-github-actions/auth step yields an empty summary.
+func TestGCPNoAuth(t *testing.T) {
+	_, _, sum := buildGCPIdentity([]*model.Step{{Run: "echo hi"}}, "key", nil)
+	if sum.Mode != AuthNone || len(sum.Steps) != 0 || len(sum.Declared) != 0 {
+		t.Errorf("summary = %+v, want AuthNone", sum)
+	}
+}
+
+// TestNewSubstitutesFederatedStep is the integration check that New wires the builder:
+// a brought GCP key rewrites the WIF step in the live model and the real action survives.
+func TestNewSubstitutesFederatedStep(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gcp.yml")
 	const wf = `name: gcp
 on: push
@@ -588,217 +649,217 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: google-github-actions/auth@v2
-      - run: echo hi
-`
-	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir()}) // GCP nil
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
-		t.Errorf("auth step should still be neutralized without creds: Uses=%q", got.Uses)
-	}
-	sum := s.GCPSummary()
-	if len(sum.Steps) != 1 || sum.File || sum.Token {
-		t.Errorf("GCPSummary = %+v, want one step and nothing injected", sum)
-	}
-	if got := gcpBind(nil, true); got != "" {
-		t.Errorf("gcpBind(nil) = %q, want empty without a credential file", got)
-	}
-	// (the no-identity env path — neutralized step, nothing injected — is asserted in TestBuildGCP.)
-}
-
-// TestBuildGCP unit-tests the env/summary assembly directly across the partial-creds
-// cases (token-only, file-only) without touching act.
-func TestBuildGCP(t *testing.T) {
-	steps := map[int]bool{2: true}
-	targets := []string{"sa via wip"}
-
-	// no auth steps -> empty, even with an identity
-	if env, sum := buildGCP(&GCPIdentity{AccessToken: "t"}, nil, nil); env != nil || len(sum.Steps) != 0 || sum.Token {
-		t.Errorf("no steps: env=%v sum=%+v, want empty", env, sum)
-	}
-
-	// auth step present but no identity -> nothing injected (the step is still
-	// neutralized at the New layer; here buildGCP just yields no env).
-	if env, sum := buildGCP(nil, steps, targets); env != nil || sum.File || sum.Token {
-		t.Errorf("no-identity: env=%v sum=%+v, want nil env, nothing injected", env, sum)
-	}
-
-	// token only -> CLOUDSDK token, no file
-	env, sum := buildGCP(&GCPIdentity{AccessToken: "tok"}, steps, targets)
-	if env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "tok" || sum.Token != true || sum.File {
-		t.Errorf("token-only: env=%v sum=%+v", env, sum)
-	}
-	if _, ok := env["GOOGLE_APPLICATION_CREDENTIALS"]; ok {
-		t.Error("token-only should not set GOOGLE_APPLICATION_CREDENTIALS")
-	}
-
-	// file only -> the GOOGLE_* contract, no token
-	env, sum = buildGCP(&GCPIdentity{CredentialFile: "/x"}, steps, targets)
-	if env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath || !sum.File || sum.Token {
-		t.Errorf("file-only: env=%v sum=%+v", env, sum)
-	}
-
-	// full identity -> both surfaces of the contract, and NEITHER a project nor
-	// GOOGLE_GHA_CREDS_PATH (setup-gcloud would --cred-file an authorized_user ADC
-	// and fail; the project is the workflow's concern, not the host's).
-	env, sum = buildGCP(&GCPIdentity{CredentialFile: "/x", AccessToken: "ya29.x"}, steps, targets)
-	if env["GOOGLE_APPLICATION_CREDENTIALS"] != gcpCredsContainerPath || env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "ya29.x" || !sum.File || !sum.Token {
-		t.Errorf("full: env=%v sum=%+v, want the full credential contract", env, sum)
-	}
-	for _, k := range []string{"GOOGLE_GHA_CREDS_PATH", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"} {
-		if _, ok := env[k]; ok {
-			t.Errorf("%s must not be set", k)
-		}
-	}
-
-	// targets carried through regardless of identity
-	if len(sum.Targets) != 1 || sum.Targets[0] != "sa via wip" {
-		t.Errorf("targets = %v, want carried through", sum.Targets)
-	}
-}
-
-// TestInterceptAWSAuth mirrors TestInterceptGCPAuth: aws-actions/configure-aws-
-// credentials is rewritten to a no-op, keeps a visible label, its declared role+region
-// target is captured, and the ambient credentials + region are summarized.
-func TestInterceptAWSAuth(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "aws.yml")
-	const wf = `name: aws
-on: push
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - id: auth
-        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::123456789012:role/deploy
-          aws-region: eu-west-1
-      - run: aws s3 ls
+          workload_identity_provider: projects/1/p/x
+          service_account: sa@proj.iam.gserviceaccount.com
+      - run: gcloud projects describe proj
 `
 	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir(),
-		AWS: &AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret", SessionToken: "tok", Account: "arn:aws:iam::1:user/me"}})
+		GCPKeyJSON: `{"client_email":"ci@proj.iam.gserviceaccount.com"}`})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
-		t.Errorf("auth step not rewritten: Uses=%q Run=%q", got.Uses, got.Run)
+	if got := s.Steps()[0]; got.Uses == "" || got.With["credentials_json"] != "${{ secrets."+gcpKeySecret+" }}" {
+		t.Errorf("New did not rewrite the federated step to key mode: %+v", got)
 	}
-	sum := s.AWSSummary()
-	if len(sum.Steps) != 1 || sum.Steps[0] != "aws-actions/configure-aws-credentials@v4" {
-		t.Errorf("AWSSummary.Steps = %v", sum.Steps)
+	if sum := s.GCPSummary(); sum.Mode != AuthSubstituted {
+		t.Errorf("GCPSummary.Mode = %v, want substituted", sum.Mode)
+	}
+}
+
+// awsRoleSteps returns a two-step slice whose first step is a federated (role-to-assume)
+// aws-actions/configure-aws-credentials, for the AWS identity-builder tests.
+func awsRoleSteps() []*model.Step {
+	return []*model.Step{
+		{ID: "auth", Uses: "aws-actions/configure-aws-credentials@v4", With: map[string]string{
+			"role-to-assume": "arn:aws:iam::123456789012:role/deploy",
+			"aws-region":     "eu-west-1",
+		}},
+		{Run: "aws s3 ls"},
+	}
+}
+
+// TestAWSSubstitute covers the default bring-a-credential path: brought static keys
+// rewrite the federated step to static-key mode, keep the declared region, and register
+// the two masked reserved secrets — direct creds, no AssumeRole.
+func TestAWSSubstitute(t *testing.T) {
+	steps := awsRoleSteps()
+	itc, secrets, sum := buildAWSIdentity(steps, "AKIA", "shh", nil)
+
+	if steps[0].Uses == "" {
+		t.Error("substitute must keep Uses so the real action runs")
+	}
+	if steps[0].With["aws-access-key-id"] != "${{ secrets."+awsKeyIDSecret+" }}" ||
+		steps[0].With["aws-secret-access-key"] != "${{ secrets."+awsSecretKeySecret+" }}" {
+		t.Errorf("static-key inputs not set: %v", steps[0].With)
+	}
+	if steps[0].With["role-to-assume"] != "" {
+		t.Errorf("role-to-assume not cleared: %v", steps[0].With)
+	}
+	if steps[0].With["aws-region"] != "eu-west-1" {
+		t.Errorf("aws-region must be kept: %v", steps[0].With)
+	}
+	if secrets[awsKeyIDSecret] != "AKIA" || secrets[awsSecretKeySecret] != "shh" {
+		t.Errorf("reserved secrets = %v, want the brought keys", secrets)
 	}
 	want := "arn:aws:iam::123456789012:role/deploy in eu-west-1"
-	if len(sum.Targets) != 1 || sum.Targets[0] != want {
-		t.Errorf("AWSSummary.Targets = %v, want [%q]", sum.Targets, want)
+	if sum.Mode != AuthSubstituted || sum.Targets[0] != want || sum.Region != "eu-west-1" {
+		t.Errorf("summary = %+v, want substituted with role target + region", sum)
 	}
-	if !sum.Creds || !sum.RegionSet || sum.Region != "eu-west-1" || sum.Account != "arn:aws:iam::1:user/me" {
-		t.Errorf("AWSSummary = %+v, want creds+region from the declared step", sum)
-	}
-	// (the injected env contract is asserted directly in TestBuildAWS.)
-}
-
-// TestAWSNoIdentity: an auth step with no ambient credentials is still neutralized
-// (so the job survives), but nothing is injected and the summary says so.
-func TestAWSNoIdentity(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "aws.yml")
-	const wf = `name: aws
-on: push
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-      - run: echo hi
-`
-	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir()}) // AWS nil
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := s.Steps()[0]; got.Uses != "" || got.Run == "" {
-		t.Errorf("auth step should still be neutralized without creds: Uses=%q", got.Uses)
-	}
-	if sum := s.AWSSummary(); len(sum.Steps) != 1 || sum.Creds || sum.RegionSet {
-		t.Errorf("AWSSummary = %+v, want one step and nothing injected", sum)
+	if len(itc.steps) != 0 {
+		t.Error("substitute needs no barrier interceptor")
 	}
 }
 
-// TestAWSRegionExpression covers the deliberate choice to honor only a literal
-// aws-region: an expression is left to act (we'd inject the raw unevaluated string).
+// TestAWSAmbient covers the opt-in fallback: neutralize the step and inject ambient
+// session credentials + the declared region at its position.
+func TestAWSAmbient(t *testing.T) {
+	steps := awsRoleSteps()
+	itc, secrets, sum := buildAWSIdentity(steps, "", "", &AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret", SessionToken: "tok", Account: "arn:aws:iam::1:user/me"})
+
+	if steps[0].Uses != "" || steps[0].Run == "" {
+		t.Errorf("ambient should neutralize the step: Uses=%q", steps[0].Uses)
+	}
+	if secrets != nil {
+		t.Errorf("ambient registers no reserved secret, got %v", secrets)
+	}
+	if sum.Mode != AuthAmbient || sum.Region != "eu-west-1" || sum.Account != "arn:aws:iam::1:user/me" {
+		t.Errorf("summary = %+v, want ambient with region+account", sum)
+	}
+	if !itc.steps[0] || itc.inject == nil {
+		t.Error("ambient needs a barrier interceptor injecting env")
+	}
+}
+
+// TestAWSDeclaredSkipped: a static-key step runs untouched even with brought keys configured.
+func TestAWSDeclaredSkipped(t *testing.T) {
+	steps := []*model.Step{
+		{Uses: "aws-actions/configure-aws-credentials@v4", With: map[string]string{
+			"aws-access-key-id":     "${{ secrets.AK }}",
+			"aws-secret-access-key": "${{ secrets.SK }}",
+		}},
+		{Run: "aws s3 ls"},
+	}
+	_, secrets, sum := buildAWSIdentity(steps, "AKIA", "shh", nil)
+	if steps[0].Uses == "" || steps[0].With["aws-access-key-id"] != "${{ secrets.AK }}" {
+		t.Errorf("static-key step must run untouched: %+v", steps[0])
+	}
+	if sum.Mode != AuthDeclared || len(sum.Declared) != 1 || secrets != nil {
+		t.Errorf("summary = %+v secrets=%v, want declared untouched", sum, secrets)
+	}
+}
+
+// TestAWSRegionExpression: only a literal aws-region is honored — an expression is left
+// to act (we'd inject the raw unevaluated string otherwise), so no region is captured.
 func TestAWSRegionExpression(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "aws.yml")
-	const wf = `name: aws
-on: push
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ vars.REGION }}
-      - run: aws s3 ls
-`
-	if err := os.WriteFile(path, []byte(wf), 0o600); err != nil {
-		t.Fatal(err)
+	steps := []*model.Step{
+		{Uses: "aws-actions/configure-aws-credentials@v4", With: map[string]string{"aws-region": "${{ vars.REGION }}"}},
+		{Run: "aws s3 ls"},
 	}
-	s, err := New(Options{WorkflowPath: path, Workdir: t.TempDir(),
-		AWS: &AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sum := s.AWSSummary(); sum.RegionSet || sum.Region != "" {
-		t.Errorf("AWSSummary = %+v, want no region injected for an expression", sum)
+	_, _, sum := buildAWSIdentity(steps, "AKIA", "shh", nil)
+	if sum.Region != "" {
+		t.Errorf("summary.Region = %q, want empty for an expression", sum.Region)
 	}
 }
 
-// TestBuildAWS unit-tests the env/summary assembly directly across the cases
-// (no steps, no identity, full creds+region, long-lived creds) without touching act.
-func TestBuildAWS(t *testing.T) {
-	steps := map[int]bool{1: true}
-	targets := []string{"role in eu-west-1"}
-
-	// no auth steps -> empty, even with an identity
-	if env, sum := buildAWS(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "s"}, nil, nil, "eu-west-1"); env != nil || len(sum.Steps) != 0 || sum.Creds {
-		t.Errorf("no steps: env=%v sum=%+v, want empty", env, sum)
+// TestAWSUnsatisfied: a federated step with no credential is neutralized.
+func TestAWSUnsatisfied(t *testing.T) {
+	steps := awsRoleSteps()
+	itc, secrets, sum := buildAWSIdentity(steps, "", "", nil)
+	if steps[0].Uses != "" {
+		t.Errorf("federated step with no credential must be neutralized: Uses=%q", steps[0].Uses)
 	}
-
-	// auth step present but no identity -> nothing injected
-	if env, sum := buildAWS(nil, steps, targets, "eu-west-1"); env != nil || sum.Creds || sum.RegionSet {
-		t.Errorf("no-identity: env=%v sum=%+v, want nil env", env, sum)
+	if sum.Mode != AuthUnsatisfied || secrets != nil || len(itc.steps) != 0 {
+		t.Errorf("summary=%+v secrets=%v, want unsatisfied", sum, secrets)
 	}
+}
 
-	// full session creds + literal region -> the env contract, both region keys
-	env, sum := buildAWS(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret", SessionToken: "tok"}, steps, targets, "eu-west-1")
+// awsAmbientEnv assembly is unit-tested directly: full session creds + region, then
+// long-lived creds with no region.
+func TestAWSAmbientEnv(t *testing.T) {
+	env := awsAmbientEnv(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret", SessionToken: "tok"}, "eu-west-1")
 	if env["AWS_ACCESS_KEY_ID"] != "AKIA" || env["AWS_SECRET_ACCESS_KEY"] != "secret" || env["AWS_SESSION_TOKEN"] != "tok" {
-		t.Errorf("creds: env=%v", env)
+		t.Errorf("creds env = %v", env)
 	}
-	if env["AWS_REGION"] != "eu-west-1" || env["AWS_DEFAULT_REGION"] != "eu-west-1" || !sum.RegionSet {
-		t.Errorf("region not injected: env=%v sum=%+v", env, sum)
+	if env["AWS_REGION"] != "eu-west-1" || env["AWS_DEFAULT_REGION"] != "eu-west-1" {
+		t.Errorf("region not injected: %v", env)
 	}
-	if !sum.Creds || sum.Region != "eu-west-1" {
-		t.Errorf("summary = %+v", sum)
-	}
-	if len(sum.Targets) != 1 || sum.Targets[0] != "role in eu-west-1" {
-		t.Errorf("targets = %v, want carried through", sum.Targets)
-	}
-
-	// long-lived creds (no session token), no region -> neither optional key set
-	env, _ = buildAWS(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret"}, steps, targets, "")
+	env = awsAmbientEnv(&AWSIdentity{AccessKeyID: "AKIA", SecretAccessKey: "secret"}, "")
 	if _, ok := env["AWS_SESSION_TOKEN"]; ok {
 		t.Error("no session token should not set AWS_SESSION_TOKEN")
 	}
 	if _, ok := env["AWS_REGION"]; ok {
 		t.Error("empty region should not set AWS_REGION")
+	}
+	if env := awsAmbientEnv(&AWSIdentity{}, "x"); env != nil {
+		t.Errorf("no creds should yield nil env, got %v", env)
+	}
+}
+
+// --- Azure (azure/login) ---
+
+// TestAzureSubstitute covers the default path: brought SP creds rewrite the federated
+// (OIDC) step to creds mode, clear the OIDC inputs, and register the masked secret.
+func TestAzureSubstitute(t *testing.T) {
+	steps := []*model.Step{
+		{Uses: "azure/login@v2", With: map[string]string{
+			"client-id":       "11111111-1111-1111-1111-111111111111",
+			"tenant-id":       "22222222-2222-2222-2222-222222222222",
+			"subscription-id": "33333333-3333-3333-3333-333333333333",
+		}},
+		{Run: "az account show"},
+	}
+	creds := `{"clientId":"11111111-1111-1111-1111-111111111111","clientSecret":"shh","tenantId":"t","subscriptionId":"s"}`
+	itc, secrets, sum := buildAzureIdentity(steps, creds)
+
+	if steps[0].Uses == "" || steps[0].With["creds"] != "${{ secrets."+azureCredsSecret+" }}" {
+		t.Errorf("not rewritten to creds mode: %+v", steps[0])
+	}
+	if steps[0].With["client-id"] != "" || steps[0].With["tenant-id"] != "" {
+		t.Errorf("OIDC inputs not cleared: %v", steps[0].With)
+	}
+	if secrets[azureCredsSecret] != creds {
+		t.Errorf("reserved secret = %q, want the creds JSON", secrets[azureCredsSecret])
+	}
+	if sum.Mode != AuthSubstituted || sum.Cloud != "Azure" || sum.Account != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("summary = %+v, want substituted with clientId account", sum)
+	}
+	if len(itc.steps) != 0 {
+		t.Error("Azure has no barrier interceptor (no ambient)")
+	}
+}
+
+// TestAzureDeclaredSkipped: a creds-mode azure/login runs untouched.
+func TestAzureDeclaredSkipped(t *testing.T) {
+	steps := []*model.Step{
+		{Uses: "azure/login@v2", With: map[string]string{"creds": "${{ secrets.AZURE_CREDENTIALS }}"}},
+		{Run: "az account show"},
+	}
+	_, secrets, sum := buildAzureIdentity(steps, `{"clientId":"x"}`)
+	if steps[0].Uses == "" || steps[0].With["creds"] != "${{ secrets.AZURE_CREDENTIALS }}" {
+		t.Errorf("creds-mode step must run untouched: %+v", steps[0])
+	}
+	if sum.Mode != AuthDeclared || len(sum.Declared) != 1 || secrets != nil {
+		t.Errorf("summary = %+v secrets=%v, want declared", sum, secrets)
+	}
+}
+
+// TestAzureUnsatisfied: a federated azure/login with no brought creds is neutralized
+// (Azure has no ambient fallback).
+func TestAzureUnsatisfied(t *testing.T) {
+	steps := []*model.Step{
+		{Uses: "azure/login@v2", With: map[string]string{"client-id": "x", "tenant-id": "y"}},
+		{Run: "az account show"},
+	}
+	_, secrets, sum := buildAzureIdentity(steps, "")
+	if steps[0].Uses != "" {
+		t.Errorf("federated step with no credential must be neutralized: Uses=%q", steps[0].Uses)
+	}
+	if sum.Mode != AuthUnsatisfied || secrets != nil {
+		t.Errorf("summary = %+v, want unsatisfied", sum)
 	}
 }
 

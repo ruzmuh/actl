@@ -264,11 +264,11 @@ func TestConfigLine(t *testing.T) {
 // notices render before the container ever starts).
 func TestRuntimeBannerRender(t *testing.T) {
 	sess, err := debugger.New(debugger.Options{
-		WorkflowPath: "../../testdata/workflows/inputs.yml",
-		EventName:    "workflow_dispatch",
-		Workdir:      t.TempDir(),
-		Secrets:      map[string]string{"GITHUB_TOKEN": "ghp_demo"},
-		Inputs:       map[string]string{"environment": "production"},
+		WorkflowPath:    "../../testdata/workflows/inputs.yml",
+		EventName:       "workflow_dispatch",
+		Workdir:         t.TempDir(),
+		Secrets:         map[string]string{"GITHUB_TOKEN": "ghp_demo"},
+		Inputs:          map[string]string{"environment": "production"},
 		Repository:      "ruzmuh/actl",
 		Ref:             "refs/heads/feature",
 		Sha:             "deadbeefcafebabe",
@@ -359,42 +359,58 @@ func TestServicesLines(t *testing.T) {
 	}
 }
 
-// TestGCPLines locks the identity transparency: the federation target vs the local
-// identity, what was injected, and the honest no-credentials case.
-func TestGCPLines(t *testing.T) {
-	// full substitution: a federation line + the mounted-file/token line
-	full := gcpLines(debugger.GCPSummary{
+// TestIdentityLines locks the identity transparency across modes: the default
+// bring-a-credential substitution, the opt-in ambient fallback with its warning, the
+// honest no-credential case, and a declared (untouched) step.
+func TestIdentityLines(t *testing.T) {
+	// substituted (default): federation line → brought credential + the GCP project hint
+	sub := identityLines(debugger.IdentitySummary{
+		Cloud:   "GCP",
+		Mode:    debugger.AuthSubstituted,
 		Steps:   []string{"auth"},
 		Targets: []string{"sa@p.iam.gserviceaccount.com via prov"},
-		Account: "me@example.com",
-		File:    true,
-		Token:   true,
+		Account: "ci@p.iam.gserviceaccount.com",
 	})
-	if len(full) != 3 {
-		t.Fatalf("want 3 lines, got %d: %v", len(full), full)
+	if len(sub) != 3 {
+		t.Fatalf("want 3 lines, got %d: %v", len(sub), sub)
 	}
-	if !strings.Contains(full[0], "would federate as sa@p.iam.gserviceaccount.com via prov") ||
-		!strings.Contains(full[0], "running locally as me@example.com") {
-		t.Errorf("federation line wrong: %q", full[0])
+	if !strings.Contains(sub[0], "would federate as sa@p.iam.gserviceaccount.com via prov") ||
+		!strings.Contains(sub[0], "brought credential (ci@p.iam.gserviceaccount.com)") {
+		t.Errorf("federation line wrong: %q", sub[0])
 	}
-	if !strings.Contains(full[1], "ADC file + access token") {
-		t.Errorf("injection line wrong: %q", full[1])
+	if !strings.Contains(sub[1], "substituted a brought credential") {
+		t.Errorf("substitute line wrong: %q", sub[1])
 	}
-	if !strings.Contains(full[2], "GOOGLE_CLOUD_PROJECT") {
-		t.Errorf("project-hint line wrong: %q", full[2])
+	if !strings.Contains(sub[2], "GOOGLE_CLOUD_PROJECT") {
+		t.Errorf("project-hint line wrong: %q", sub[2])
 	}
 
-	// no credentials: still names the step, but says cloud calls will fail
-	none := gcpLines(debugger.GCPSummary{Steps: []string{"auth"}, Targets: []string{"sa via prov"}})
-	if len(none) != 2 || !strings.Contains(none[1], "no ambient credentials") {
+	// ambient (opt-in): the warning that a refresh-token credential is in the container
+	amb := identityLines(debugger.IdentitySummary{
+		Cloud: "GCP", Mode: debugger.AuthAmbient, Steps: []string{"auth"}, Targets: []string{"sa via prov"},
+		Account: "me@example.com", File: true, Token: true,
+	})
+	if !strings.Contains(amb[0], "running locally as me@example.com") {
+		t.Errorf("ambient federation line wrong: %q", amb[0])
+	}
+	if !strings.Contains(amb[1], "refresh-token credential is now in the container") {
+		t.Errorf("ambient warning line wrong: %q", amb[1])
+	}
+
+	// no credential: still names the step, but says cloud calls will fail with a fix hint
+	none := identityLines(debugger.IdentitySummary{Cloud: "Azure", Mode: debugger.AuthUnsatisfied, Steps: []string{"azure/login"}, Targets: []string{"app in tenant t"}})
+	if len(none) != 2 || !strings.Contains(none[1], "no credential") || !strings.Contains(none[1], "-azure-creds-file") {
 		t.Errorf("no-creds lines wrong: %v", none)
 	}
-	if !strings.Contains(none[0], "your ambient gcloud identity") {
-		t.Errorf("missing-account fallback wrong: %q", none[0])
+
+	// declared (key/secret mode): one untouched line, no federation lines
+	dec := identityLines(debugger.IdentitySummary{Cloud: "AWS", Mode: debugger.AuthDeclared, Declared: []string{"auth"}})
+	if len(dec) != 1 || !strings.Contains(dec[0], "run as declared") {
+		t.Errorf("declared line wrong: %v", dec)
 	}
 
 	// no auth step: nothing rendered
-	if got := gcpLines(debugger.GCPSummary{}); got != nil {
+	if got := identityLines(debugger.IdentitySummary{Cloud: "GCP"}); got != nil {
 		t.Errorf("no auth step should render nothing, got %v", got)
 	}
 }

@@ -1,0 +1,27 @@
+# Demonstrates the secret/key-mode path for AWS: an aws-actions/configure-aws-credentials
+# that already uses static access keys authenticates WITHOUT GitHub OIDC, so it runs
+# faithfully on a local runner with ZERO interception — actl leaves the step untouched.
+# Just supply the secrets it references:
+#
+#   printf 'AWS_ACCESS_KEY_ID=AKIA...\nAWS_SECRET_ACCESS_KEY=...\n' >> .secrets
+#   go run ./cmd/actl -image catthehacker/ubuntu:full-latest testdata/workflows/aws-auth-keys.yml
+#
+# The TUI's transparency line says the step "runs as declared". For the federated
+# (role-to-assume) variant — where actl substitutes brought keys by default — see
+# aws-auth.yml. (`aws` must be in the runner image; use catthehacker:full-latest.)
+name: aws-auth-keys
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: who am i
+        run: aws sts get-caller-identity

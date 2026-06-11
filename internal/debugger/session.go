@@ -91,12 +91,20 @@ type Options struct {
 	Environments    map[string]EnvOverlay      // per-`environment:` secrets/vars overlays, keyed by environment name; the one matching the debugged job's `environment:` is merged over Secrets/Vars
 	SecretOverrides map[string]string          // secrets.* applied last (after the env overlay) so an explicit CLI -secret wins; nil for library callers
 	VarOverrides    map[string]string          // vars.* applied last (after the env overlay) so an explicit CLI -var wins; nil for library callers
-	GCP             *GCPIdentity               // ambient GCP creds to substitute for a federated google-github-actions/auth (nil = leave auth steps untouched)
-	AWS             *AWSIdentity               // ambient AWS creds to substitute for a federated aws-actions/configure-aws-credentials (nil = leave auth steps untouched)
-	Needs           map[string]NeedsInput      // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
-	BreakOnError    bool                       // in Continue mode, halt after a step that errored
-	Breakpoints     []int                      // zero-based step indices to halt before, in Continue mode
-	BreakpointNames []string                   // step names to halt before, resolved to indices against the job's steps in New (a name with no matching step is an error)
+	// Cloud identity (CLAUDE.md §4). The default is bring-a-credential: a scoped
+	// non-personal credential rewrites a federated auth step to its secret/key mode so
+	// the real action runs. Ambient personal login is an opt-in fallback (GCP/AWS only;
+	// Azure has none) — non-nil GCP/AWS means -…-ambient was set and the creds resolved.
+	GCPKeyJSON         string                // service-account key JSON content → rewrites a federated google-github-actions/auth to credentials_json mode
+	AzureCredsJSON     string                // service-principal creds JSON content → rewrites a federated azure/login to creds mode
+	AWSAccessKeyID     string                // brought static access key id → rewrites a federated aws-actions/configure-aws-credentials to static-key mode
+	AWSSecretAccessKey string                // brought static secret access key (paired with AWSAccessKeyID)
+	GCP                *GCPIdentity          // ambient GCP creds for the opt-in fallback (nil unless -gcp-ambient)
+	AWS                *AWSIdentity          // ambient AWS creds for the opt-in fallback (nil unless -aws-ambient)
+	Needs              map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
+	BreakOnError       bool                  // in Continue mode, halt after a step that errored
+	Breakpoints        []int                 // zero-based step indices to halt before, in Continue mode
+	BreakpointNames    []string              // step names to halt before, resolved to indices against the job's steps in New (a name with no matching step is an error)
 
 	// Runtime context GitHub injects in real CI that a clean local runner lacks
 	// — all seed-and-be-honest surfaces (CLAUDE.md §4), each with a transparency line.
@@ -175,8 +183,9 @@ type Session struct {
 	configSummary   ConfigSummary        // redacted names of supplied secrets/vars/env (for transparency)
 	envSummary      EnvSummary           // per-`environment:` overlay applied for the job (for transparency)
 	servicesSummary ServicesSummary      // names of the job's `services:` containers (for transparency)
-	gcpSummary      GCPSummary           // redacted view of the GCP identity substitution (for transparency)
-	awsSummary      AWSSummary           // redacted view of the AWS identity substitution (for transparency)
+	gcpSummary      IdentitySummary      // redacted view of the GCP identity handling (for transparency)
+	awsSummary      IdentitySummary      // redacted view of the AWS identity handling (for transparency)
+	azureSummary    IdentitySummary      // redacted view of the Azure identity handling (for transparency)
 	tokenSummary    TokenSummary         // how github.token was satisfied (for transparency)
 	inputsSummary   InputsSummary        // declared/supplied workflow inputs (for transparency)
 	eventSummary    EventSummary         // the github.event payload backing the run (for transparency)
@@ -288,18 +297,18 @@ func New(opts Options) (*Session, error) {
 	// there's a checkout to satisfy).
 	checkouts := interceptSteps(steps, isDefaultCheckout, checkoutNoopMsg, nil)
 
-	// Ambient GCP identity substitution (CLAUDE.md §4): a federated
-	// google-github-actions/auth can't mint a GitHub OIDC token locally, so it would
-	// fail and kill the job. The interceptor rewrites it to a no-op and (given ambient
-	// creds) injects them at its position. Built even without credentials so the auth
-	// step is still neutralized and non-cloud steps stay debuggable.
-	gcpItc, gcpSummary := buildGCPInterceptor(opts.GCP, steps)
-
-	// Ambient AWS identity substitution (CLAUDE.md §4), same shape as GCP: a federated
-	// aws-actions/configure-aws-credentials can't assume a role via a GitHub OIDC token
-	// locally, so the interceptor rewrites it to a no-op and (given ambient creds)
-	// injects them — and the step's declared aws-region — at its position.
-	awsItc, awsSummary := buildAWSInterceptor(opts.AWS, steps)
+	// Cloud identity handling (CLAUDE.md §4). A federated auth step (WIF / OIDC /
+	// role-to-assume) can't mint a GitHub OIDC token locally, so it would fail and kill
+	// the job. The default is bring-a-credential: a scoped non-personal credential
+	// rewrites the step to its secret/key mode (in place, mutating steps here) so the
+	// real action runs faithfully; the brought material is registered as a reserved
+	// masked secret below. Secret/key-mode steps run untouched. Failing a brought
+	// credential, the opt-in ambient fallback (GCP/AWS only) no-ops the step and injects
+	// ambient creds at its position; failing that too, the step is neutralized so
+	// non-cloud steps stay debuggable. Azure has no ambient fallback.
+	gcpItc, gcpSecrets, gcpSummary := buildGCPIdentity(steps, opts.GCPKeyJSON, opts.GCP)
+	awsItc, awsSecrets, awsSummary := buildAWSIdentity(steps, opts.AWSAccessKeyID, opts.AWSSecretAccessKey, opts.AWS)
+	_, azureSecrets, azureSummary := buildAzureIdentity(steps, opts.AzureCredsJSON)
 
 	// Per-`environment:` secrets/vars overlay (CLAUDE.md §4 multi-env). The job may
 	// target a deployment environment (e.g. `environment: production`) whose secrets/
@@ -320,6 +329,15 @@ func New(opts Options) (*Session, error) {
 	// resolveToken mirrors github.token into secrets, so the token isn't double-counted
 	// here (it has its own TokenSummary).
 	configSummary := summarizeConfig(secrets, vars, opts.Env)
+
+	// Register the reserved identity secrets the brought-credential rewrites reference
+	// (${{ secrets.ACTL_* }}) — added AFTER configSummary so they don't appear in the
+	// names line, but in Config.Secrets so act's valueMasker masks their values in logs.
+	for _, m := range []map[string]string{gcpSecrets, awsSecrets, azureSecrets} {
+		for k, v := range m {
+			secrets[k] = v
+		}
+	}
 
 	// Runtime context GitHub injects that a clean local runner lacks (CLAUDE.md §4):
 	// GITHUB_TOKEN, workflow inputs, the event payload, and the github.* context.
@@ -417,6 +435,7 @@ func New(opts Options) (*Session, error) {
 		servicesSummary: buildServices(run.Job()),
 		gcpSummary:      gcpSummary,
 		awsSummary:      awsSummary,
+		azureSummary:    azureSummary,
 		tokenSummary:    tokenSummary,
 		inputsSummary:   inputsSummary,
 		eventSummary:    eventSummary,
@@ -529,15 +548,19 @@ func (s *Session) EnvSummary() EnvSummary { return s.envSummary }
 // starts natively when the job runs), for a transparency line. Empty when none.
 func (s *Session) ServicesSummary() ServicesSummary { return s.servicesSummary }
 
-// GCPSummary returns the redacted view of the GCP identity substitution (which
-// auth steps were intercepted, the federation target vs the local identity), for a
-// transparency line. Its Steps are empty when the job has no auth step.
-func (s *Session) GCPSummary() GCPSummary { return s.gcpSummary }
+// GCPSummary returns the redacted view of the GCP identity handling (which auth steps
+// were intercepted, the federation target, and how they were satisfied), for a
+// transparency line. Its Steps/Declared are empty when the job has no auth step.
+func (s *Session) GCPSummary() IdentitySummary { return s.gcpSummary }
 
-// AWSSummary returns the redacted view of the AWS identity substitution (which auth
-// steps were intercepted, the role+region vs the local identity), for a transparency
-// line. Its Steps are empty when the job has no aws-actions/configure-aws-credentials step.
-func (s *Session) AWSSummary() AWSSummary { return s.awsSummary }
+// AWSSummary returns the redacted view of the AWS identity handling, for a transparency
+// line. Its Steps/Declared are empty when the job has no aws-actions/configure-aws-credentials step.
+func (s *Session) AWSSummary() IdentitySummary { return s.awsSummary }
+
+// AzureSummary returns the redacted view of the Azure identity handling, for a
+// transparency line. Azure has no ambient fallback (CLAUDE.md §4). Its Steps/Declared are
+// empty when the job has no azure/login step.
+func (s *Session) AzureSummary() IdentitySummary { return s.azureSummary }
 
 // TokenSummary reports how github.token was satisfied (set from a flag/secret, or
 // absent), for a transparency line.

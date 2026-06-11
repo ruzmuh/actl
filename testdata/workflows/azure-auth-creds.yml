@@ -1,0 +1,24 @@
+# Demonstrates the secret/key-mode path: an azure/login that already uses the legacy
+# service-principal `creds:` input authenticates WITHOUT GitHub OIDC, so it runs
+# faithfully on a local runner with ZERO interception — actl leaves the step untouched
+# and the real action logs in. Just supply the secret it references:
+#
+#   echo 'AZURE_CREDENTIALS={"clientId":"...","clientSecret":"...","tenantId":"...","subscriptionId":"..."}' >> .secrets
+#   go run ./cmd/actl -image catthehacker/ubuntu:full-latest testdata/workflows/azure-auth-creds.yml
+#
+# The TUI's transparency line says the step "runs as declared — workflow credential,
+# not intercepted". (`az` must be in the runner image; use catthehacker:full-latest.)
+name: azure-auth-creds
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: who am i
+        run: az account show

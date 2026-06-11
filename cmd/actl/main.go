@@ -50,10 +50,15 @@ func main() {
 	secretFile := flag.String("secret-file", ".secrets", "dotenv file of secrets.* (skipped if absent; keep it out of git)")
 	varFile := flag.String("var-file", ".vars", "dotenv file of vars.* (skipped if absent)")
 	envFile := flag.String("env-file", ".env", "dotenv file of env vars (skipped if absent)")
-	gcpIdentity := flag.Bool("gcp-identity", true, "substitute ambient gcloud ADC for a federated google-github-actions/auth step (=false leaves it untouched)")
-	gcpCreds := flag.String("gcp-credentials", "", "path to the ADC json to inject (default: discover gcloud's application_default_credentials.json)")
-	awsIdentity := flag.Bool("aws-identity", true, "substitute ambient AWS credentials for a federated aws-actions/configure-aws-credentials step (=false leaves it untouched)")
-	awsProfile := flag.String("aws-profile", "", "AWS profile to resolve ambient credentials from (default: the default profile / environment)")
+	gcpKeyFile := flag.String("gcp-key-file", "", "service-account key JSON to substitute for a federated google-github-actions/auth step (the default bring-a-credential path)")
+	azureCredsFile := flag.String("azure-creds-file", "", "service-principal creds JSON to substitute for a federated azure/login step (Azure has no ambient fallback)")
+	awsKeysFile := flag.String("aws-keys-file", "", "dotenv file with AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY to substitute for a federated aws-actions/configure-aws-credentials step")
+	gcpAmbient := flag.Bool("gcp-ambient", false, "opt-in fallback: use ambient gcloud ADC for a federated google-github-actions/auth step (mounts a refresh-token credential into the container)")
+	awsAmbient := flag.Bool("aws-ambient", false, "opt-in fallback: use ambient AWS credentials for a federated aws-actions/configure-aws-credentials step")
+	gcpIdentity := flag.Bool("gcp-identity", false, "deprecated alias for -gcp-ambient")
+	awsIdentity := flag.Bool("aws-identity", false, "deprecated alias for -aws-ambient")
+	gcpCreds := flag.String("gcp-credentials", "", "path to the ADC json for -gcp-ambient (default: discover gcloud's application_default_credentials.json)")
+	awsProfile := flag.String("aws-profile", "", "AWS profile for -aws-ambient (default: the default profile / environment)")
 	githubToken := flag.String("github-token", "", "value for github.token / secrets.GITHUB_TOKEN (default: GITHUB_TOKEN from .secrets, else ambient 'gh auth token')")
 	eventFile := flag.String("event-file", "", "path to a github.event payload JSON (sets github.event.*)")
 	repository := flag.String("repository", "", "override github.repository (default: derive owner/repo from the local git 'origin' remote)")
@@ -152,19 +157,51 @@ func main() {
 
 	bpIdx, bpNames := splitBreakpoints(cfg.Breakpoints)
 
-	// Ambient GCP identity: only resolved (and gcloud invoked) when the workflow
-	// actually has a google-github-actions/auth step — kept lazy so non-GCP runs
-	// never shell out. Host concern: the core consumes the resolved data.
-	var gcp *debugger.GCPIdentity
-	if *gcpIdentity {
-		gcp = gatherGCPIdentity(path, *gcpCreds)
+	// Cloud identity (CLAUDE.md §4). Default: bring a credential — a key/creds file
+	// rewrites the federated auth step to its secret/key mode so the real action runs.
+	// Ambient personal login is an opt-in fallback (-…-ambient; GCP/AWS only — Azure has
+	// none). The deprecated -gcp-identity/-aws-identity flags alias the ambient bools.
+	// All file reads / CLI shell-outs stay lazy — only when the workflow uses the action.
+	gcpKeyFilePath := orConfig(set["gcp-key-file"], *gcpKeyFile, identityFile(cfg, "gcp"))
+	awsKeysFilePath := orConfig(set["aws-keys-file"], *awsKeysFile, identityFile(cfg, "aws"))
+	azureCredsFilePath := orConfig(set["azure-creds-file"], *azureCredsFile, identityFile(cfg, "azure"))
+	useGCPAmbient := boolOrConfig(set["gcp-ambient"], *gcpAmbient, identityAmbient(cfg, "gcp")) || *gcpIdentity
+	useAWSAmbient := boolOrConfig(set["aws-ambient"], *awsAmbient, identityAmbient(cfg, "aws")) || *awsIdentity
+	if set["gcp-identity"] {
+		fmt.Fprintln(os.Stderr, "actl: -gcp-identity is deprecated; use -gcp-ambient")
+	}
+	if set["aws-identity"] {
+		fmt.Fprintln(os.Stderr, "actl: -aws-identity is deprecated; use -aws-ambient")
 	}
 
-	// Ambient AWS identity: same laziness — only resolved (and the aws CLI invoked)
-	// when the workflow actually has an aws-actions/configure-aws-credentials step.
+	var gcpKeyJSON, azureCredsJSON, awsKeyID, awsSecretKey string
+	var gcp *debugger.GCPIdentity
 	var aws *debugger.AWSIdentity
-	if *awsIdentity {
-		aws = gatherAWSIdentity(path, *awsProfile)
+	if workflowUses(path, debugger.GCPAuthAction) {
+		if gcpKeyFilePath != "" {
+			if gcpKeyJSON, err = readCredFile(gcpKeyFilePath); err != nil {
+				fmt.Fprintln(os.Stderr, "actl:", err)
+				os.Exit(2)
+			}
+		} else if useGCPAmbient {
+			gcp = gatherGCPIdentity(path, *gcpCreds)
+		}
+	}
+	if workflowUses(path, debugger.AWSAuthAction) {
+		if awsKeysFilePath != "" {
+			if awsKeyID, awsSecretKey, err = readAWSKeys(awsKeysFilePath); err != nil {
+				fmt.Fprintln(os.Stderr, "actl:", err)
+				os.Exit(2)
+			}
+		} else if useAWSAmbient {
+			aws = gatherAWSIdentity(path, *awsProfile)
+		}
+	}
+	if workflowUses(path, debugger.AzureAuthAction) && azureCredsFilePath != "" {
+		if azureCredsJSON, err = readCredFile(azureCredsFilePath); err != nil {
+			fmt.Fprintln(os.Stderr, "actl:", err)
+			os.Exit(2)
+		}
 	}
 
 	// github.token: explicit flag wins; the core falls back to a GITHUB_TOKEN in the
@@ -186,35 +223,39 @@ func main() {
 	ghOverrides := setFlags(set, "repository", "ref", "sha", "actor")
 
 	opts := debugger.Options{
-		WorkflowPath:    path,
-		EventName:       eventName,
-		JobID:           jobID,
-		Matrix:          resolveMatrix(cfg.Matrix, matrix),
-		WithDeps:        withDepsVal,
-		Workdir:         workdirPath,
-		Source:          sourceDir,
-		Image:           *image,
-		Images:          resolveImages(cfg.Images, platforms),
-		BreakOnError:    *breakOnError,
-		Breakpoints:     bpIdx,
-		BreakpointNames: bpNames,
-		Needs:           needsMap,
-		Secrets:         secretMap,
-		Vars:            varMap,
-		Env:             envMap,
-		Environments:    environments,
-		SecretOverrides: secretOverrides,
-		VarOverrides:    varOverrides,
-		GCP:             gcp,
-		AWS:             aws,
-		GitHubToken:     token,
-		Inputs:          mergeStrMap(cfg.Inputs, parseKeyVals(inputs)),
-		EventPath:       *eventFile,
-		Repository:      repo,
-		Ref:             gref,
-		Sha:             gsha,
-		Actor:           *actor,
-		GitHubOverrides: ghOverrides,
+		WorkflowPath:       path,
+		EventName:          eventName,
+		JobID:              jobID,
+		Matrix:             resolveMatrix(cfg.Matrix, matrix),
+		WithDeps:           withDepsVal,
+		Workdir:            workdirPath,
+		Source:             sourceDir,
+		Image:              *image,
+		Images:             resolveImages(cfg.Images, platforms),
+		BreakOnError:       *breakOnError,
+		Breakpoints:        bpIdx,
+		BreakpointNames:    bpNames,
+		Needs:              needsMap,
+		Secrets:            secretMap,
+		Vars:               varMap,
+		Env:                envMap,
+		Environments:       environments,
+		SecretOverrides:    secretOverrides,
+		VarOverrides:       varOverrides,
+		GCPKeyJSON:         gcpKeyJSON,
+		AzureCredsJSON:     azureCredsJSON,
+		AWSAccessKeyID:     awsKeyID,
+		AWSSecretAccessKey: awsSecretKey,
+		GCP:                gcp,
+		AWS:                aws,
+		GitHubToken:        token,
+		Inputs:             mergeStrMap(cfg.Inputs, parseKeyVals(inputs)),
+		EventPath:          *eventFile,
+		Repository:         repo,
+		Ref:                gref,
+		Sha:                gsha,
+		Actor:              *actor,
+		GitHubOverrides:    ghOverrides,
 	}
 
 	if err := run(opts); err != nil {
@@ -316,6 +357,61 @@ func orConfig(set bool, flagVal, cfgVal string) string {
 		return cfgVal
 	}
 	return flagVal
+}
+
+// boolOrConfig resolves a bool with the precedence CLI flag > .actl.yml > flag default:
+// a flag the user set wins; otherwise a non-nil config value; otherwise the flag's default.
+func boolOrConfig(set bool, flagVal bool, cfgVal *bool) bool {
+	if !set && cfgVal != nil {
+		return *cfgVal
+	}
+	return flagVal
+}
+
+// identityFile / identityAmbient read one cloud's identity config from .actl.yml (the
+// brought-credential file path and the opt-in ambient flag). cloud is "gcp"/"aws"/"azure".
+func identityFile(cfg *config.Config, cloud string) string { return cloudIdentity(cfg, cloud).File }
+func identityAmbient(cfg *config.Config, cloud string) *bool {
+	return cloudIdentity(cfg, cloud).Ambient
+}
+
+func cloudIdentity(cfg *config.Config, cloud string) config.CloudIdentity {
+	switch cloud {
+	case "gcp":
+		return cfg.Identity.GCP
+	case "aws":
+		return cfg.Identity.AWS
+	case "azure":
+		return cfg.Identity.Azure
+	}
+	return config.CloudIdentity{}
+}
+
+// readCredFile reads a brought-credential file's content (SA key / SP creds JSON), trimmed.
+// An empty path yields "" (no credential); a set-but-unreadable path is an error.
+func readCredFile(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read credential file %s: %w", path, err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// readAWSKeys reads a dotenv file of AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (the brought
+// static keys). An empty path yields empty strings; a set-but-unreadable path is an error.
+func readAWSKeys(path string) (id, secret string, err error) {
+	if path == "" {
+		return "", "", nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("read AWS keys file %s: %w", path, err)
+	}
+	kv := parseKeyVals(strings.Split(string(b), "\n"))
+	return kv["AWS_ACCESS_KEY_ID"], kv["AWS_SECRET_ACCESS_KEY"], nil
 }
 
 // mergeStrMap overlays b onto a (b wins) into a fresh map, or nil when both are empty.

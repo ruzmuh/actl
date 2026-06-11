@@ -144,8 +144,9 @@ func noticeLines(sess *debugger.Session) []string {
 	if svc := servicesLine(sess.ServicesSummary()); svc != "" {
 		lines = append(lines, svc)
 	}
-	lines = append(lines, gcpLines(sess.GCPSummary())...)
-	lines = append(lines, awsLines(sess.AWSSummary())...)
+	lines = append(lines, identityLines(sess.GCPSummary())...)
+	lines = append(lines, identityLines(sess.AWSSummary())...)
+	lines = append(lines, identityLines(sess.AzureSummary())...)
 	return lines
 }
 
@@ -175,75 +176,93 @@ func servicesLine(s debugger.ServicesSummary) string {
 		len(s.Names), strings.Join(s.Names, ", "))
 }
 
-// gcpLines renders the GCP identity substitution: the federation each auth step
-// would have used in real CI vs the local identity we run as, and what we injected.
-// This honest notice is the point of ambient substitution (CLAUDE.md §4). Empty
-// when the job has no google-github-actions/auth step.
-func gcpLines(g debugger.GCPSummary) []string {
-	if len(g.Steps) == 0 {
-		return nil
-	}
-	local := g.Account
-	if local == "" {
-		local = "your ambient gcloud identity"
-	}
+// identityLines renders one cloud's identity handling for the transparency banner: which
+// secret/key-mode steps run as declared (untouched), and for each federated auth step the
+// federation it would have used in real CI vs how actl satisfied it locally — a brought
+// scoped credential (the default), the opt-in ambient personal login, or nothing. The
+// honesty here is itself a feature (CLAUDE.md §4). Empty when the job has no auth step for
+// this cloud. Shared by GCP, AWS, and Azure.
+func identityLines(s debugger.IdentitySummary) []string {
+	name := strings.ToLower(s.Cloud)
 	var lines []string
-	for i, step := range g.Steps {
+	if len(s.Declared) > 0 {
+		lines = append(lines, fmt.Sprintf("%s auth: %s run as declared — workflow credential, not intercepted", name, strings.Join(s.Declared, ", ")))
+	}
+	if len(s.Steps) == 0 {
+		return lines
+	}
+	for i, step := range s.Steps {
 		target := "(federated identity)"
-		if i < len(g.Targets) {
-			target = g.Targets[i]
+		if i < len(s.Targets) {
+			target = s.Targets[i]
 		}
-		lines = append(lines, fmt.Sprintf("gcp identity (%s): would federate as %s → running locally as %s", step, target, local))
+		lines = append(lines, fmt.Sprintf("%s identity (%s): would federate as %s → %s", name, step, target, identityDest(s)))
 	}
-	switch {
-	case g.File && g.Token:
-		lines = append(lines, "gcp identity: mounted ambient ADC file + access token into the job")
-	case g.File:
-		lines = append(lines, "gcp identity: mounted ambient ADC file into the job")
-	case g.Token:
-		lines = append(lines, "gcp identity: injected an ambient access token into the job")
-	default:
-		lines = append(lines, "gcp identity: no ambient credentials found — cloud calls will fail (run: gcloud auth application-default login)")
+	switch s.Mode {
+	case debugger.AuthSubstituted:
+		if name == "aws" && s.Region != "" {
+			lines = append(lines, fmt.Sprintf("%s identity: substituted a brought credential (region %s) — the real action runs", name, s.Region))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s identity: substituted a brought credential — the real action runs", name))
+		}
+	case debugger.AuthAmbient:
+		lines = append(lines, ambientLine(s, name))
+	case debugger.AuthUnsatisfied:
+		lines = append(lines, fmt.Sprintf("%s identity: no credential — cloud calls will fail (%s)", name, identityFixHint(name)))
 	}
-	// We authenticate but never set a project (that's the workflow's concern, as on
-	// GitHub) — surface it so a later project-less gcloud/SDK call's failure isn't a
-	// surprise. Only when creds were actually injected; the no-creds case above already
-	// has its own actionable message.
-	if g.File || g.Token {
+	// GCP authenticates but never sets a project (the workflow's concern, as on GitHub) —
+	// surface it so a later project-less gcloud/SDK call's failure isn't a surprise.
+	if name == "gcp" && (s.Mode == debugger.AuthSubstituted || s.Mode == debugger.AuthAmbient) {
 		lines = append(lines, "gcp identity: no project set by actl — pass GOOGLE_CLOUD_PROJECT via -env if a step needs one")
 	}
 	return lines
 }
 
-// awsLines renders the AWS identity substitution: the role+region each auth step
-// would have federated as in real CI vs the local identity we run as, and what we
-// injected. The AWS analog of gcpLines (CLAUDE.md §4). Empty when the job has no
-// aws-actions/configure-aws-credentials step.
-func awsLines(a debugger.AWSSummary) []string {
-	if len(a.Steps) == 0 {
-		return nil
-	}
-	local := a.Account
-	if local == "" {
-		local = "your ambient AWS identity"
-	}
-	var lines []string
-	for i, step := range a.Steps {
-		target := "(federated identity)"
-		if i < len(a.Targets) {
-			target = a.Targets[i]
+// identityDest describes the identity a federated step runs as locally, for the line.
+func identityDest(s debugger.IdentitySummary) string {
+	switch s.Mode {
+	case debugger.AuthSubstituted:
+		if s.Account != "" {
+			return "brought credential (" + s.Account + ")"
 		}
-		lines = append(lines, fmt.Sprintf("aws identity (%s): would federate as %s → running locally as %s", step, target, local))
-	}
-	switch {
-	case a.Creds && a.RegionSet:
-		lines = append(lines, fmt.Sprintf("aws identity: injected ambient credentials + region %s into the job", a.Region))
-	case a.Creds:
-		lines = append(lines, "aws identity: injected ambient credentials into the job — no region set; pass AWS_REGION via -env if a step needs one")
+		return "a brought credential"
+	case debugger.AuthAmbient:
+		if s.Account != "" {
+			return "running locally as " + s.Account
+		}
+		return "running locally as your ambient identity"
 	default:
-		lines = append(lines, "aws identity: no ambient credentials found — cloud calls will fail (run: aws sso login, or set -aws-profile)")
+		return "neutralized (no credential)"
 	}
-	return lines
+}
+
+// ambientLine renders the opt-in ambient fallback status, with the warning that a personal
+// credential is now in the container (GCP/AWS only; Azure has no ambient fallback).
+func ambientLine(s debugger.IdentitySummary, name string) string {
+	if name == "gcp" {
+		if s.File {
+			return "gcp identity: mounted ambient ADC into the job — ⚠ a re-mintable refresh-token credential is now in the container"
+		}
+		return "gcp identity: injected an ambient access token into the job"
+	}
+	if s.Region != "" {
+		return fmt.Sprintf("aws identity: injected ambient credentials + region %s — ⚠ personal credentials are now in the container", s.Region)
+	}
+	return "aws identity: injected ambient credentials — ⚠ personal credentials are now in the container; no region set, pass AWS_REGION via -env"
+}
+
+// identityFixHint names how to supply a credential for a cloud whose federated step has
+// none, for the unsatisfied line.
+func identityFixHint(name string) string {
+	switch name {
+	case "gcp":
+		return "pass -gcp-key-file, or -gcp-ambient"
+	case "aws":
+		return "pass -aws-keys-file, or -aws-ambient"
+	case "azure":
+		return "pass -azure-creds-file; Azure has no ambient fallback"
+	}
+	return ""
 }
 
 // needsLines renders one transparency line per need: which upstream job is being

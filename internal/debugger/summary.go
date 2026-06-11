@@ -55,16 +55,35 @@ type GitHubContextSummary struct {
 	Overridden []string // which of repository/ref/sha/actor came from a flag
 }
 
-// GCPSummary is a redacted view of the GCP identity substitution for a transparency
-// line: which auth steps were intercepted, the federation target each one would have
-// used in real CI, and the local identity we run as instead. No token material is
-// retained here.
-type GCPSummary struct {
-	Steps   []string // intercepted google-github-actions/auth step labels
-	Targets []string // "<service_account> via <workload_identity_provider>" per step (as declared)
-	Account string   // local ambient identity we run as ("" if none was found)
-	File    bool     // an ADC credential file was mounted into the container
-	Token   bool     // an access token was injected
+// AuthMode describes how a cloud's federated auth steps were handled locally — the
+// identity strategy is bring-a-credential by default, with ambient personal login only
+// as an opt-in fallback (CLAUDE.md §4). One value per cloud, for the transparency line.
+type AuthMode int
+
+const (
+	AuthNone        AuthMode = iota // the job has no auth step for this cloud
+	AuthDeclared                    // only secret/key-mode steps — left to run as declared (faithful, untouched)
+	AuthSubstituted                 // federated steps rewritten to a brought scoped credential (the default path)
+	AuthAmbient                     // federated steps satisfied by the dev's ambient personal login (opt-in fallback)
+	AuthUnsatisfied                 // federated steps neutralized — no credential available, cloud calls will fail
+)
+
+// IdentitySummary is a redacted view of one cloud's identity handling for a transparency
+// line: which federated auth steps were intercepted, the federation target each would
+// have used in real CI, which mode satisfied them (substituted brought credential /
+// ambient / none), and the identity we run as. No credential material is retained here.
+// Shared by GCP, AWS, and Azure (CLAUDE.md §4).
+type IdentitySummary struct {
+	Cloud    string   // "GCP" / "AWS" / "Azure" — names the line
+	Mode     AuthMode // how the federated steps were handled
+	Steps    []string // intercepted federated auth step labels
+	Targets  []string // federation target per federated step (as declared in the workflow)
+	Declared []string // secret/key-mode step labels left to run untouched
+	Account  string   // the identity we run as (brought principal, or ambient account)
+	Region   string   // AWS only: the declared aws-region honored ("" otherwise)
+	// Ambient-only detail (Mode == AuthAmbient), for the GCP/AWS ambient line:
+	File  bool // an ambient credential file was mounted into the container (GCP)
+	Token bool // an ambient access token was injected (GCP)
 }
 
 // ServicesSummary lists the names of the job's `services:` containers, for a
@@ -72,19 +91,6 @@ type GCPSummary struct {
 // that they will start. Empty when the job declares no services.
 type ServicesSummary struct {
 	Names []string // service container names (sorted)
-}
-
-// AWSSummary is a redacted view of the AWS identity substitution for a transparency
-// line, the AWS analog of GCPSummary: which auth steps were intercepted, the role +
-// region each would have federated as in real CI, and the local identity we run as.
-// No credential material is retained here.
-type AWSSummary struct {
-	Steps     []string // intercepted aws-actions/configure-aws-credentials step labels
-	Targets   []string // "<role-to-assume> in <region>" per step (as declared)
-	Account   string   // local caller arn we run as ("" if unknown)
-	Region    string   // the declared aws-region actl honors ("" if none / an expression)
-	Creds     bool     // ambient credentials were injected
-	RegionSet bool     // AWS_REGION/AWS_DEFAULT_REGION were injected from the declared region
 }
 
 // EnvSummary describes the per-`environment:` overlay applied for the debugged job, for

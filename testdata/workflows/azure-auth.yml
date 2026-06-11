@@ -1,0 +1,42 @@
+# Demonstrates the bring-a-credential identity default for a federated azure/login.
+# In real CI the step below federates a GitHub OIDC token into Azure (the modern,
+# secret-less OIDC mode); locally there is no OIDC issuer, so actl rewrites the step
+# to its service-principal-secret mode using a credential YOU bring, then runs the
+# REAL azure/login — so it authenticates faithfully, under a scoped non-personal
+# identity whose real permissions are exercised. Azure has NO ambient fallback (that
+# would mean mounting ~/.azure, a refresh-token-bearing personal credential).
+#
+# Create a service principal once, then point actl at its creds JSON:
+#
+#   az ad sp create-for-rbac --name actl-debug --json > ~/azure-sp.json
+#   go run ./cmd/actl -image catthehacker/ubuntu:full-latest \
+#       -azure-creds-file ~/azure-sp.json testdata/workflows/azure-auth.yml
+#
+# The brought creds are loaded into a masked reserved secret and referenced from the
+# rewritten step's `creds:` input — never printed. Without -azure-creds-file the step
+# is neutralized and the TUI says cloud calls will fail (the honest no-credential path).
+#
+# Note: the `az` CLI must be in the runner IMAGE (the medium catthehacker image lacks
+# it — that's image parity, not the substitution). Use catthehacker/ubuntu:full-latest.
+#
+# The client-id/tenant-id/subscription-id below are placeholders — only the presence of
+# a federated azure/login (no `creds:` input) matters for the local rewrite.
+name: azure-auth
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: azure/login@v2
+        with:
+          client-id: 11111111-1111-1111-1111-111111111111
+          tenant-id: 22222222-2222-2222-2222-222222222222
+          subscription-id: 33333333-3333-3333-3333-333333333333
+      - name: who am i (as the brought service principal)
+        run: az account show

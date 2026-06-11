@@ -3,6 +3,7 @@ package debugger
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,24 +11,24 @@ import (
 	"github.com/nektos/act/pkg/runner"
 )
 
-// GCPIdentity is the host-resolved ambient GCP credentials the CLI passes in for
-// identity substitution (CLAUDE.md §4). Locally there is no GitHub OIDC issuer, so
-// `google-github-actions/auth` can't federate; instead we intercept that step and
-// inject the dev's already-present credentials. The core never shells out to gcloud
-// — discovery/minting is a host concern (cmd/actl); the core only consumes the data.
+// GCPIdentity is the host-resolved ambient GCP credentials the CLI passes in for the
+// opt-in ambient fallback (CLAUDE.md §4). The default identity path is bring-a-credential
+// (a service-account key, see Options.GCPKeyJSON); ambient is used only when the dev opts
+// in with -gcp-ambient. Locally there is no GitHub OIDC issuer, so a federated
+// `google-github-actions/auth` (WIF) can't mint a token; ambient intercepts that step and
+// injects the dev's already-present credentials. The core never shells out to gcloud —
+// discovery/minting is a host concern (cmd/actl); the core only consumes the data.
 type GCPIdentity struct {
 	CredentialFile string // host path to the ADC json, bind-mounted ro into the container
 	AccessToken    string // ambient ADC access token → CLOUDSDK_AUTH_ACCESS_TOKEN
 	Account        string // local identity, for the transparency line (best-effort, may be empty)
 }
 
-// AWSIdentity is the host-resolved ambient AWS credentials the CLI passes in for
-// identity substitution (CLAUDE.md §4), the AWS analog of GCPIdentity. Locally there
-// is no GitHub OIDC issuer, so `aws-actions/configure-aws-credentials` can't federate
-// a role; instead we intercept that step and inject the dev's already-resolved
-// session credentials (e.g. from `aws configure export-credentials`). Unlike GCP these
-// are env-only — no file is mounted — so the core just injects them at the step's
-// position. Discovery is a host concern (cmd/actl); the core only consumes the data.
+// AWSIdentity is the host-resolved ambient AWS credentials for the opt-in ambient
+// fallback (CLAUDE.md §4), the AWS analog of GCPIdentity. The default is bring-a-credential
+// (static keys, see Options.AWSAccessKeyID/AWSSecretAccessKey); ambient is used only with
+// -aws-ambient. Unlike GCP these are env-only — no file is mounted — so the core just
+// injects them at the step's position. Discovery is a host concern (cmd/actl).
 type AWSIdentity struct {
 	AccessKeyID     string // → AWS_ACCESS_KEY_ID
 	SecretAccessKey string // → AWS_SECRET_ACCESS_KEY
@@ -37,6 +38,24 @@ type AWSIdentity struct {
 
 // container path the ambient ADC file is mounted at (matches the env we inject).
 const gcpCredsContainerPath = "/actl/gcp/adc.json"
+
+// Reserved secret names the brought-credential substitution loads into Config.Secrets so
+// act's valueMasker (runner/logger.go) masks them in logs, then references from the
+// rewritten step's `with:` via ${{ secrets.<name> }}. CLAUDE.md §4.
+const (
+	gcpKeySecret       = "ACTL_GCP_CREDENTIALS_JSON"
+	azureCredsSecret   = "ACTL_AZURE_CREDENTIALS"
+	awsKeyIDSecret     = "ACTL_AWS_ACCESS_KEY_ID"
+	awsSecretKeySecret = "ACTL_AWS_SECRET_ACCESS_KEY"
+)
+
+// Auth action refs intercepted for identity handling (§4). Exported so a host-side
+// pre-scan (cmd/actl) can keep cloud-CLI invocation lazy without re-spelling the literals.
+const (
+	GCPAuthAction   = "google-github-actions/auth"
+	AWSAuthAction   = "aws-actions/configure-aws-credentials"
+	AzureAuthAction = "azure/login"
+)
 
 // isDefaultCheckout reports whether a step is `actions/checkout` with no input
 // that changes which code or where it lands (ref/repository/path). Only those are
@@ -68,10 +87,11 @@ func checkoutWantsSubmodules(st *model.Step) bool {
 }
 
 // stepInterceptor neutralizes a class of steps that can't run faithfully on a local
-// runner (a default actions/checkout, a federated cloud-auth) and substitutes the
-// real local effect at the step's position. Built once in New; the barrier and the
-// container wiring then iterate []stepInterceptor uniformly, so AWS/Azure are one
-// more builder + append — no new barrier code and no new Session fields.
+// runner and substitutes the real local effect at the step's position. Built once in New;
+// the barrier and the container wiring then iterate []stepInterceptor uniformly. Used for
+// the checkout substitution and the opt-in ambient cloud-auth fallback (the default
+// bring-a-credential identity path rewrites the step in place instead and needs no
+// barrier participation — the real action runs).
 type stepInterceptor struct {
 	name      string                                                       // "checkout", "gcp-auth" — names the non-fatal failure log
 	steps     map[int]bool                                                 // indices it rewrote to no-ops, within the debugged job
@@ -79,19 +99,30 @@ type stepInterceptor struct {
 	container string                                                       // docker flags appended to Config.ContainerOptions; "" = none
 }
 
-// No-op scripts the rewritten steps run in place of their real action (so the step
+// No-op scripts the neutralized steps run in place of their real action (so the step
 // still shows in logs that actl handled it).
 const (
 	checkoutNoopMsg = `echo "actl: checkout intercepted — using your local working tree"`
-	gcpAuthNoopMsg  = `echo "actl: GCP auth intercepted — using ambient identity"`
-	awsAuthNoopMsg  = `echo "actl: AWS auth intercepted — using ambient identity"`
+	gcpAuthNoopMsg  = `echo "actl: GCP auth intercepted — no credential, see transparency notice"`
+	awsAuthNoopMsg  = `echo "actl: AWS auth intercepted — no credential, see transparency notice"`
+	azureNoopMsg    = `echo "actl: Azure auth intercepted — no credential, see transparency notice"`
 )
 
-// interceptSteps rewrites every step matching `match` to a no-op echoing `msg`,
-// preserving its label (so the rewritten step still shows its origin), and returns
-// the rewritten indices. `capture`, if non-nil, runs on each matched step BEFORE its
-// Uses/With are cleared (e.g. to read a cloud-auth step's federation target). This is
-// the shared mechanic every interceptor's scan/rewrite is built from.
+// noopStep neutralizes a step: clear its action and inputs, preserve its label (so the
+// rewritten step still shows its origin), and run msg in place. The shared mechanic for
+// every step actl renders inert.
+func noopStep(st *model.Step, msg string) {
+	if st.Name == "" {
+		st.Name = st.Uses // keep the original label visible after we clear Uses
+	}
+	st.Uses = ""
+	st.With = nil
+	st.Run = msg
+}
+
+// interceptSteps neutralizes every step matching `match` (via noopStep) and returns the
+// rewritten indices. `capture`, if non-nil, runs on each matched step BEFORE its
+// Uses/With are cleared (e.g. to read a step's inputs).
 func interceptSteps(steps []*model.Step, match func(*model.Step) bool, msg string, capture func(*model.Step)) map[int]bool {
 	out := map[int]bool{}
 	for i, st := range steps {
@@ -101,24 +132,11 @@ func interceptSteps(steps []*model.Step, match func(*model.Step) bool, msg strin
 		if capture != nil {
 			capture(st)
 		}
-		if st.Name == "" {
-			st.Name = st.Uses // keep the original label visible after we clear Uses
-		}
-		st.Uses = ""
-		st.With = nil
-		st.Run = msg
+		noopStep(st, msg)
 		out[i] = true
 	}
 	return out
 }
-
-// Auth action refs intercepted for ambient-identity substitution (§4). Exported
-// so a host-side pre-scan (cmd/actl) can keep cloud-CLI invocation lazy without
-// re-spelling the literals.
-const (
-	GCPAuthAction = "google-github-actions/auth"
-	AWSAuthAction = "aws-actions/configure-aws-credentials"
-)
 
 // StepUses reports whether step st uses action, matching both the bare ref
 // ("owner/repo") and a pinned version ("owner/repo@v2"). The one place actl
@@ -127,39 +145,69 @@ func StepUses(st *model.Step, action string) bool {
 	return st.Uses == action || strings.HasPrefix(st.Uses, action+"@")
 }
 
-// isGCPAuth reports whether a step uses google-github-actions/auth (any version).
-func isGCPAuth(st *model.Step) bool { return StepUses(st, GCPAuthAction) }
-
-// buildGCPInterceptor scans and rewrites each google-github-actions/auth step to a
-// no-op (so it doesn't try to federate against a GitHub OIDC issuer that doesn't
-// exist locally), then assembles the substitution: the ambient credential env to
-// inject at the step's position and the read-only ADC volume mount. Returns the
-// interceptor plus a redacted GCPSummary for the transparency line. With no auth step
-// the interceptor owns nothing (and isn't attached); with a step but no identity it
-// still neutralizes the step so the job survives, injecting nothing.
-func buildGCPInterceptor(id *GCPIdentity, steps []*model.Step) (stepInterceptor, GCPSummary) {
-	var targets []string
-	gcpSteps := interceptSteps(steps, isGCPAuth, gcpAuthNoopMsg, func(st *model.Step) {
-		targets = append(targets, gcpTarget(st))
-	})
-	env, summary := buildGCP(id, gcpSteps, targets)
-	summary.Steps = stepLabelsOf(steps, gcpSteps)
-
-	itc := stepInterceptor{name: "gcp-auth", steps: gcpSteps, container: gcpBind(id, len(gcpSteps) > 0)}
-	if len(env) > 0 {
-		// info.Env is the live job env map (the same one SetEnv mutates), so writing
-		// here propagates the credential contract to subsequent step execs.
-		itc.inject = func(_ context.Context, info runner.StepBarrierInfo) error {
-			for k, v := range env {
-				info.Env[k] = v
-			}
-			return nil
+// scanIdentity classifies a cloud's auth steps into declared (secret/key mode — left to
+// run untouched, faithful) and federated (need help locally), returning the federated
+// step indices and a partially-filled summary (Cloud/Mode set by the caller). This is the
+// shared front half of every identity builder.
+func scanIdentity(steps []*model.Step, action string, keyMode func(*model.Step) bool, target func(*model.Step) string) ([]int, IdentitySummary) {
+	var fed []int
+	var sum IdentitySummary
+	for i, st := range steps {
+		if !StepUses(st, action) {
+			continue
 		}
+		if keyMode(st) {
+			sum.Declared = append(sum.Declared, st.String())
+			continue
+		}
+		sum.Steps = append(sum.Steps, st.String())
+		sum.Targets = append(sum.Targets, target(st))
+		fed = append(fed, i)
 	}
-	return itc, summary
+	return fed, sum
 }
 
-// gcpTarget describes the federation an auth step declares, for the transparency
+// injectEnv returns a barrier inject that writes env into the live job env map (the same
+// map SetEnv mutates), so the credential contract propagates to subsequent step execs.
+func injectEnv(env map[string]string) func(context.Context, runner.StepBarrierInfo) error {
+	return func(_ context.Context, info runner.StepBarrierInfo) error {
+		for k, v := range env {
+			info.Env[k] = v
+		}
+		return nil
+	}
+}
+
+// indexSet turns a slice of step indices into the set form stepInterceptor.steps uses.
+func indexSet(idx []int) map[int]bool {
+	m := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		m[i] = true
+	}
+	return m
+}
+
+// jsonField best-effort extracts a string field from a JSON credential blob, for the
+// transparency line (e.g. the SA key's client_email). "" on any failure.
+func jsonField(content, key string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(content), &m) != nil {
+		return ""
+	}
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// --- GCP (google-github-actions/auth) ---------------------------------------------
+
+// gcpKeyMode reports whether an auth step already declares a service-account key
+// (credentials_json) — i.e. it authenticates without federation and runs faithfully
+// locally, so we leave it alone.
+func gcpKeyMode(st *model.Step) bool { return st.With["credentials_json"] != "" }
+
+// gcpTarget describes the federation a WIF auth step declares, for the transparency
 // line — read before we clear With. Falls back to a generic label if unset.
 func gcpTarget(st *model.Step) string {
 	sa := st.With["service_account"]
@@ -176,62 +224,101 @@ func gcpTarget(st *model.Step) string {
 	}
 }
 
-// buildGCP assembles the credential env injected at the auth step's position and a
-// redacted summary for the transparency line. With no identity (id == nil) it
-// returns no env but still summarizes the intercepted steps, so the UI can say the
-// steps were neutralized but cloud calls will fail.
-func buildGCP(id *GCPIdentity, steps map[int]bool, targets []string) (map[string]string, GCPSummary) {
-	summary := GCPSummary{Targets: targets}
-	if len(steps) == 0 {
-		return nil, GCPSummary{} // no auth step → nothing to report
+// rewriteGCPToKey converts a federated (WIF) auth step into service-account-key mode,
+// referencing the brought key as a masked secret expression — the real action then runs
+// a faithful key auth. CLAUDE.md §4 (bring-a-credential default).
+func rewriteGCPToKey(st *model.Step) {
+	if st.With == nil {
+		st.With = map[string]string{}
 	}
-	if id == nil {
-		return nil, summary
-	}
+	delete(st.With, "workload_identity_provider")
+	delete(st.With, "service_account")
+	st.With["credentials_json"] = "${{ secrets." + gcpKeySecret + " }}"
+}
+
+// gcpAmbientEnv assembles the ambient credential env injected at the auth step's position
+// (the opt-in fallback). nil when there's nothing to inject.
+func gcpAmbientEnv(id *GCPIdentity) map[string]string {
 	env := map[string]string{}
 	if id.CredentialFile != "" {
 		// Client libraries (Go/Python/terraform's google provider) discover ADC here.
-		// We deliberately do NOT set GOOGLE_GHA_CREDS_PATH: setup-gcloud consumes it to
-		// run `gcloud auth login --cred-file`, which rejects the authorized_user ADC
-		// that `gcloud auth application-default login` produces ("only external/service
-		// account JSON supported"). The access token below authenticates gcloud
-		// universally instead, so that path is both unnecessary and harmful here.
 		env["GOOGLE_APPLICATION_CREDENTIALS"] = gcpCredsContainerPath
-		summary.File = true
 	}
 	if id.AccessToken != "" {
-		// Authenticates gcloud/gsutil/bq directly (any ADC type), and satisfies
-		// setup-gcloud's own `isAuthenticated()` check so it doesn't warn.
+		// Authenticates gcloud/gsutil/bq directly (any ADC type).
 		env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = id.AccessToken
-		summary.Token = true
 	}
-	// We deliberately do NOT inject a project. In real CI the project comes from the
-	// workflow (the auth step's project_id input, or an explicit --project / env on
-	// the command); fabricating one from the host's gcloud config wouldn't exist on
-	// GitHub. If a run needs GOOGLE_CLOUD_PROJECT, supply it via the generic env path
-	// (.env / -env), same as any other env var.
-	summary.Account = id.Account
 	if len(env) == 0 {
-		env = nil
+		return nil
 	}
-	return env, summary
+	return env
 }
 
-// gcpBind returns the docker volume option that mounts the ambient ADC file
-// read-only into the job container, or "" when there's no file to mount or no auth
-// step to satisfy. The mount path matches the GOOGLE_APPLICATION_CREDENTIALS env.
-func gcpBind(id *GCPIdentity, hasAuthSteps bool) string {
-	if id == nil || id.CredentialFile == "" || !hasAuthSteps {
+// gcpBind returns the docker volume option mounting the ambient ADC file read-only into
+// the job container (the opt-in fallback). "" when there's no file. This is the path that
+// puts a refresh-token-bearing file in the container — hence ambient is opt-in + warned.
+func gcpBind(id *GCPIdentity) string {
+	if id == nil || id.CredentialFile == "" {
 		return ""
 	}
 	return fmt.Sprintf("-v %s:%s:ro", id.CredentialFile, gcpCredsContainerPath)
 }
 
-// isAWSAuth reports whether a step uses aws-actions/configure-aws-credentials (any version).
-func isAWSAuth(st *model.Step) bool { return StepUses(st, AWSAuthAction) }
+// buildGCPIdentity classifies the job's google-github-actions/auth steps and handles the
+// federated ones by the identity strategy (CLAUDE.md §4): a brought SA key rewrites them
+// to key mode so the real action runs (default); else the opt-in ambient fallback no-ops
+// them and injects ambient creds; else they're neutralized with an honest summary. Returns
+// the (possibly empty) ambient interceptor, the reserved secrets to register, and the
+// summary. Key-mode steps are left untouched to run faithfully.
+func buildGCPIdentity(steps []*model.Step, keyJSON string, ambient *GCPIdentity) (stepInterceptor, map[string]string, IdentitySummary) {
+	fed, sum := scanIdentity(steps, GCPAuthAction, gcpKeyMode, gcpTarget)
+	sum.Cloud = "GCP"
+	if len(fed) == 0 {
+		if len(sum.Declared) > 0 {
+			sum.Mode = AuthDeclared
+		}
+		return stepInterceptor{}, nil, sum
+	}
+	switch {
+	case keyJSON != "":
+		for _, i := range fed {
+			rewriteGCPToKey(steps[i])
+		}
+		sum.Mode = AuthSubstituted
+		sum.Account = jsonField(keyJSON, "client_email")
+		return stepInterceptor{}, map[string]string{gcpKeySecret: keyJSON}, sum
+	case ambient != nil:
+		for _, i := range fed {
+			noopStep(steps[i], gcpAuthNoopMsg)
+		}
+		itc := stepInterceptor{name: "gcp-auth", steps: indexSet(fed), container: gcpBind(ambient)}
+		if env := gcpAmbientEnv(ambient); len(env) > 0 {
+			itc.inject = injectEnv(env)
+		}
+		sum.Mode = AuthAmbient
+		sum.Account = ambient.Account
+		sum.File = ambient.CredentialFile != ""
+		sum.Token = ambient.AccessToken != ""
+		return itc, nil, sum
+	default:
+		for _, i := range fed {
+			noopStep(steps[i], gcpAuthNoopMsg)
+		}
+		sum.Mode = AuthUnsatisfied
+		return stepInterceptor{}, nil, sum
+	}
+}
 
-// awsTarget describes the federation an auth step declares (role + region), for the
-// transparency line — read before we clear With. Falls back to a generic label.
+// --- AWS (aws-actions/configure-aws-credentials) ----------------------------------
+
+// awsKeyMode reports whether an auth step already declares static access keys — it runs
+// faithfully locally without federation, so we leave it alone.
+func awsKeyMode(st *model.Step) bool {
+	return st.With["aws-access-key-id"] != "" && st.With["aws-secret-access-key"] != ""
+}
+
+// awsTarget describes the federation a role-to-assume auth step declares (role + region),
+// for the transparency line — read before we clear With. Falls back to a generic label.
 func awsTarget(st *model.Step) string {
 	role := st.With["role-to-assume"]
 	region := st.With["aws-region"]
@@ -243,83 +330,167 @@ func awsTarget(st *model.Step) string {
 	case region != "":
 		return "region " + region
 	default:
-		return "(static credentials)"
+		return "(federated identity)"
 	}
 }
 
-// buildAWSInterceptor scans and rewrites each aws-actions/configure-aws-credentials
-// step to a no-op (so it doesn't try to assume a role via a GitHub OIDC token that
-// can't be minted locally), then assembles the substitution: the ambient session
-// credentials to inject at the step's position plus the region the step declared.
-// Returns the interceptor and a redacted AWSSummary. AWS is env-only — no file mount
-// — so unlike GCP the interceptor sets no container option.
-func buildAWSInterceptor(id *AWSIdentity, steps []*model.Step) (stepInterceptor, AWSSummary) {
-	var targets []string
-	var region string
-	awsSteps := interceptSteps(steps, isAWSAuth, awsAuthNoopMsg, func(st *model.Step) {
-		targets = append(targets, awsTarget(st))
-		// Capture the first declared literal region; the action exports it, so
-		// reproducing it is faithful (unlike GCP's project, region is a declared input
-		// here). Skip expressions — we'd inject the raw unevaluated string otherwise.
-		if region == "" {
-			if r := st.With["aws-region"]; r != "" && !strings.Contains(r, "${{") {
-				region = r
-			}
-		}
-	})
-	env, summary := buildAWS(id, awsSteps, targets, region)
-	summary.Steps = stepLabelsOf(steps, awsSteps)
-
-	itc := stepInterceptor{name: "aws-auth", steps: awsSteps}
-	if len(env) > 0 {
-		// info.Env is the live job env map (the same one SetEnv mutates), so writing
-		// here propagates the credential contract to subsequent step execs.
-		itc.inject = func(_ context.Context, info runner.StepBarrierInfo) error {
-			for k, v := range env {
-				info.Env[k] = v
-			}
-			return nil
+// firstAWSRegion returns the first literal aws-region declared by a federated auth step
+// (expressions skipped — we'd inject the raw unevaluated string otherwise). The action
+// exports the region, so reproducing it is faithful.
+func firstAWSRegion(steps []*model.Step, fed []int) string {
+	for _, i := range fed {
+		if r := steps[i].With["aws-region"]; r != "" && !strings.Contains(r, "${{") {
+			return r
 		}
 	}
-	return itc, summary
+	return ""
 }
 
-// buildAWS assembles the credential env injected at the auth step's position and a
-// redacted summary for the transparency line. With no identity (id == nil) it returns
-// no env but still summarizes the intercepted steps, so the UI can say the steps were
-// neutralized but cloud calls will fail. The region (from the step's declared
-// aws-region) is injected only alongside credentials — region without creds is useless.
-func buildAWS(id *AWSIdentity, steps map[int]bool, targets []string, region string) (map[string]string, AWSSummary) {
-	summary := AWSSummary{Targets: targets, Region: region}
-	if len(steps) == 0 {
-		return nil, AWSSummary{} // no auth step → nothing to report
+// rewriteAWSToKeys converts a federated (role-to-assume) auth step into static-key mode,
+// referencing the brought keys as masked secret expressions; the declared aws-region is
+// kept so the real action exports it. Direct credentials, no sts:AssumeRole (CLAUDE.md §4).
+func rewriteAWSToKeys(st *model.Step) {
+	if st.With == nil {
+		st.With = map[string]string{}
 	}
-	if id == nil {
-		return nil, summary
+	for _, k := range []string{"role-to-assume", "web-identity-token-file", "role-chaining", "audience", "role-session-name"} {
+		delete(st.With, k)
 	}
-	env := map[string]string{}
-	if id.AccessKeyID != "" && id.SecretAccessKey != "" {
-		env["AWS_ACCESS_KEY_ID"] = id.AccessKeyID
-		env["AWS_SECRET_ACCESS_KEY"] = id.SecretAccessKey
-		summary.Creds = true
-		if id.SessionToken != "" {
-			env["AWS_SESSION_TOKEN"] = id.SessionToken // temporary (SSO / assumed-role) creds
+	st.With["aws-access-key-id"] = "${{ secrets." + awsKeyIDSecret + " }}"
+	st.With["aws-secret-access-key"] = "${{ secrets." + awsSecretKeySecret + " }}"
+}
+
+// awsAmbientEnv assembles the ambient credential env injected at the auth step's position
+// (the opt-in fallback), plus the declared region. nil when there are no credentials.
+func awsAmbientEnv(id *AWSIdentity, region string) map[string]string {
+	if id.AccessKeyID == "" || id.SecretAccessKey == "" {
+		return nil
+	}
+	env := map[string]string{
+		"AWS_ACCESS_KEY_ID":     id.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY": id.SecretAccessKey,
+	}
+	if id.SessionToken != "" {
+		env["AWS_SESSION_TOKEN"] = id.SessionToken // temporary (SSO / assumed-role) creds
+	}
+	if region != "" {
+		env["AWS_REGION"] = region
+		env["AWS_DEFAULT_REGION"] = region
+	}
+	return env
+}
+
+// buildAWSIdentity is the AWS analog of buildGCPIdentity. Federated role-to-assume steps
+// are handled by: brought static keys → rewrite to key mode (default, real action runs);
+// else opt-in ambient → no-op + inject ambient creds; else neutralize. Key-mode steps are
+// left untouched.
+func buildAWSIdentity(steps []*model.Step, keyID, secretKey string, ambient *AWSIdentity) (stepInterceptor, map[string]string, IdentitySummary) {
+	fed, sum := scanIdentity(steps, AWSAuthAction, awsKeyMode, awsTarget)
+	sum.Cloud = "AWS"
+	if len(fed) == 0 {
+		if len(sum.Declared) > 0 {
+			sum.Mode = AuthDeclared
 		}
-		if region != "" {
-			env["AWS_REGION"] = region
-			env["AWS_DEFAULT_REGION"] = region
-			summary.RegionSet = true
+		return stepInterceptor{}, nil, sum
+	}
+	region := firstAWSRegion(steps, fed)
+	sum.Region = region
+	switch {
+	case keyID != "" && secretKey != "":
+		for _, i := range fed {
+			rewriteAWSToKeys(steps[i])
 		}
+		sum.Mode = AuthSubstituted
+		return stepInterceptor{}, map[string]string{awsKeyIDSecret: keyID, awsSecretKeySecret: secretKey}, sum
+	case ambient != nil:
+		for _, i := range fed {
+			noopStep(steps[i], awsAuthNoopMsg)
+		}
+		itc := stepInterceptor{name: "aws-auth", steps: indexSet(fed)}
+		if env := awsAmbientEnv(ambient, region); len(env) > 0 {
+			itc.inject = injectEnv(env)
+		}
+		sum.Mode = AuthAmbient
+		sum.Account = ambient.Account
+		return itc, nil, sum
+	default:
+		for _, i := range fed {
+			noopStep(steps[i], awsAuthNoopMsg)
+		}
+		sum.Mode = AuthUnsatisfied
+		return stepInterceptor{}, nil, sum
 	}
-	summary.Account = id.Account
-	if len(env) == 0 {
-		env = nil
+}
+
+// --- Azure (azure/login) ----------------------------------------------------------
+
+// azureCredsMode reports whether an azure/login step already declares a service-principal
+// secret (creds) — it runs faithfully locally without federation, so we leave it alone.
+func azureCredsMode(st *model.Step) bool { return st.With["creds"] != "" }
+
+// azureTarget describes the federation an OIDC azure/login step declares, for the
+// transparency line — read before we clear With. Falls back to a generic label.
+func azureTarget(st *model.Step) string {
+	client := st.With["client-id"]
+	tenant := st.With["tenant-id"]
+	sub := st.With["subscription-id"]
+	switch {
+	case client != "" && tenant != "":
+		return client + " in tenant " + tenant
+	case client != "":
+		return client
+	case sub != "":
+		return "subscription " + sub
+	default:
+		return "(federated identity)"
 	}
-	return env, summary
+}
+
+// rewriteAzureToCreds converts a federated (OIDC) azure/login step into
+// service-principal-secret mode, referencing the brought creds JSON as a masked secret
+// expression; the real action then runs a faithful SP login. CLAUDE.md §4. Azure has no
+// ambient fallback (it would mean mounting ~/.azure, a refresh-token-bearing personal
+// credential — the worst-blast-radius variant of what this pivot moves away from).
+func rewriteAzureToCreds(st *model.Step) {
+	if st.With == nil {
+		st.With = map[string]string{}
+	}
+	for _, k := range []string{"client-id", "tenant-id", "subscription-id", "auth-type"} {
+		delete(st.With, k)
+	}
+	st.With["creds"] = "${{ secrets." + azureCredsSecret + " }}"
+}
+
+// buildAzureIdentity classifies the job's azure/login steps: creds-mode steps run
+// untouched; a brought SP creds JSON rewrites federated steps to creds mode (the real
+// action runs); else they're neutralized with an honest summary. There is no Azure ambient
+// fallback, so this never returns an interceptor with steps.
+func buildAzureIdentity(steps []*model.Step, credsJSON string) (stepInterceptor, map[string]string, IdentitySummary) {
+	fed, sum := scanIdentity(steps, AzureAuthAction, azureCredsMode, azureTarget)
+	sum.Cloud = "Azure"
+	if len(fed) == 0 {
+		if len(sum.Declared) > 0 {
+			sum.Mode = AuthDeclared
+		}
+		return stepInterceptor{}, nil, sum
+	}
+	if credsJSON != "" {
+		for _, i := range fed {
+			rewriteAzureToCreds(steps[i])
+		}
+		sum.Mode = AuthSubstituted
+		sum.Account = jsonField(credsJSON, "clientId")
+		return stepInterceptor{}, map[string]string{azureCredsSecret: credsJSON}, sum
+	}
+	for _, i := range fed {
+		noopStep(steps[i], azureNoopMsg)
+	}
+	sum.Mode = AuthUnsatisfied
+	return stepInterceptor{}, nil, sum
 }
 
 // stepLabelsOf returns the labels of the steps whose indices are set in mark, in
-// order — used to name intercepted steps (checkout, GCP auth) for transparency.
+// order — used to name intercepted steps (checkout) for transparency.
 func stepLabelsOf(steps []*model.Step, mark map[int]bool) []string {
 	var out []string
 	for i, st := range steps {
