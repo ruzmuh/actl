@@ -18,6 +18,7 @@ jobs:
         run: echo "stage is now '$STAGE'"
       - name: compute version
         run: echo "VERSION=1.2.3" >> "$GITHUB_ENV"
+      - run: echo "step with no name"
       - name: build
         run: echo "building $VERSION at stage $STAGE"
       - name: linger
