@@ -1,4 +1,4 @@
-// Package debugger is actl's frontend-agnostic core (see CLAUDE.md §5). It owns
+// Package debugger is actl's frontend-agnostic core. It owns
 // the barrier-driven pause loop and the halt/pass policy; it imports no frontend,
 // prints nothing, and owns no terminal. The TUI, a future DAP server, and the
 // headless/agent driver are all peers that consume this API:
@@ -62,98 +62,6 @@ func dockerPreflight() error {
 		return &DockerUnavailableError{Cause: err}
 	}
 	return nil
-}
-
-// EnvOverlay is a per-`environment:` overlay of secrets/vars applied when the debugged
-// job targets that deployment environment (GHA scopes secrets/vars by `environment:`).
-// The host (cmd/actl) resolves each environment's secret-file/inline-vars into these
-// flat maps; the core merges the matching one over the flat defaults (CLI overrides
-// still win — see New).
-type EnvOverlay struct {
-	Secrets map[string]string
-	Vars    map[string]string
-}
-
-// Options configures a debug Session. Only WorkflowPath is required.
-type Options struct {
-	WorkflowPath    string                     // path to the workflow file
-	EventName       string                     // event to plan for (default "push")
-	JobID           string                     // which job to debug; required only if the event plans more than one
-	Matrix          map[string]map[string]bool // matrix combination to pin (act's Config.Matrix shape: key→value→true); required only if the job's matrix has more than one combination
-	WithDeps        bool                       // run the job's upstream needs for real (to completion) before debugging it, instead of isolating
-	Image           string                     // docker image mapped to ubuntu-latest when Images is empty (default catthehacker); back-compat sugar for Images
-	Images          map[string]string          // runner label → docker image (act's -P/Platforms map); empty falls back to {ubuntu-latest: Image}
-	Workdir         string                     // workspace bind-mounted into the container so local 'uses: ./' actions resolve; empty = an isolated empty temp dir (steps can't write to your tree). NOTE: a set workdir is mounted, so steps can write to it
-	Source          string                     // working tree a default actions/checkout copies into the workspace (no host mutation); empty = current dir. Ignored when Workdir is set
-	Secrets         map[string]string          // secrets.* base (flat defaults, e.g. from secret-file); the env overlay and SecretOverrides layer on top
-	Vars            map[string]string          // vars.* base (flat defaults); the env overlay and VarOverrides layer on top
-	Env             map[string]string          // extra env for containers
-	Environments    map[string]EnvOverlay      // per-`environment:` secrets/vars overlays, keyed by environment name; the one matching the debugged job's `environment:` is merged over Secrets/Vars
-	SecretOverrides map[string]string          // secrets.* applied last (after the env overlay) so an explicit CLI -secret wins; nil for library callers
-	VarOverrides    map[string]string          // vars.* applied last (after the env overlay) so an explicit CLI -var wins; nil for library callers
-	// Cloud identity (CLAUDE.md §4). The default is bring-a-credential: a scoped
-	// non-personal credential rewrites a federated auth step to its secret/key mode so
-	// the real action runs. Ambient personal login is an opt-in fallback (GCP/AWS only;
-	// Azure has none) — non-nil GCP/AWS means -…-ambient was set and the creds resolved.
-	GCPKeyJSON         string                // service-account key JSON content → rewrites a federated google-github-actions/auth to credentials_json mode
-	AzureCredsJSON     string                // service-principal creds JSON content → rewrites a federated azure/login to creds mode
-	AWSAccessKeyID     string                // brought static access key id → rewrites a federated aws-actions/configure-aws-credentials to static-key mode
-	AWSSecretAccessKey string                // brought static secret access key (paired with AWSAccessKeyID)
-	GCP                *GCPIdentity          // ambient GCP creds for the opt-in fallback (nil unless -gcp-ambient)
-	AWS                *AWSIdentity          // ambient AWS creds for the opt-in fallback (nil unless -aws-ambient)
-	Needs              map[string]NeedsInput // seeded needs.<job>.* for isolated debugging, keyed by upstream job id (ignored with WithDeps)
-	BreakOnError       bool                  // in Continue mode, halt after a step that errored
-	Breakpoints        []int                 // zero-based step indices to halt before, in Continue mode
-	BreakpointNames    []string              // step names to halt before, resolved to indices against the job's steps in New (a name with no matching step is an error)
-
-	// Runtime context GitHub injects in real CI that a clean local runner lacks
-	// — all seed-and-be-honest surfaces (CLAUDE.md §4), each with a transparency line.
-	GitHubToken string            // GITHUB_TOKEN → github.token (and mirrored into secrets.GITHUB_TOKEN); empty falls back to Secrets["GITHUB_TOKEN"]
-	Inputs      map[string]string // workflow_dispatch/workflow_call inputs.* (user values; act applies declared defaults + typing on top)
-	EventPath   string            // path to a github.event payload JSON; empty = "{}" (plus any Inputs)
-	Repository  string            // override github.repository (env GITHUB_REPOSITORY); empty = act derives from local git
-	Ref         string            // override github.ref (env GITHUB_REF); empty = act derives from local git
-	Sha         string            // override github.sha (env SHA_REF, act's read key); empty = act derives from local git
-	Actor       string            // override github.actor (Config.Actor); empty = act's "nektos/act" placeholder
-	// GitHubOverrides names the github.* fields the user set explicitly by flag (any of
-	// "repository"/"ref"/"sha"/"actor"), so the transparency line marks those as overrides.
-	// The values above may also be filled from local git for an honest display — only an
-	// entry here means the user overrode it, not merely that the value is non-empty.
-	GitHubOverrides []string
-}
-
-// When marks which side of a step's main executor a pause occurred on. It mirrors
-// the fork's runner.BarrierWhen but keeps act's type out of frontend code.
-type When int
-
-const (
-	Before When = iota // before the step's main executor ran
-	After              // after the step's main executor returned
-)
-
-func (w When) String() string {
-	if w == After {
-		return "after"
-	}
-	return "before"
-}
-
-// PauseEvent is emitted when the run halts at a step boundary.
-type PauseEvent struct {
-	When  When        // before or after the step's main executor
-	Index int         // zero-based step index within the job
-	Step  *model.Step // the step at this boundary
-	Err   error       // for When==After: the step's error, or nil
-}
-
-// ProgressEvent is emitted as the run passes a step's "before" boundary without
-// halting (Continue mode, no breakpoint), so a frontend can follow execution — the
-// step-list highlight tracks the running step even when no pause fires. It's purely
-// advisory: the send is non-blocking and may be dropped under load, and the
-// authoritative state is still PauseEvent/Done. Emitted only for the debugged job.
-type ProgressEvent struct {
-	Index int         // zero-based step index now starting
-	Step  *model.Step // the step at this boundary
 }
 
 // mode is the run policy consulted at each barrier.
@@ -297,7 +205,7 @@ func New(opts Options) (*Session, error) {
 	// there's a checkout to satisfy).
 	checkouts := interceptSteps(steps, isDefaultCheckout, checkoutNoopMsg, nil)
 
-	// Cloud identity handling (CLAUDE.md §4). A federated auth step (WIF / OIDC /
+	// Cloud identity handling. A federated auth step (WIF / OIDC /
 	// role-to-assume) can't mint a GitHub OIDC token locally, so it would fail and kill
 	// the job. The default is bring-a-credential: a scoped non-personal credential
 	// rewrites the step to its secret/key mode (in place, mutating steps here) so the
@@ -310,7 +218,7 @@ func New(opts Options) (*Session, error) {
 	awsItc, awsSecrets, awsSummary := buildAWSIdentity(steps, opts.AWSAccessKeyID, opts.AWSSecretAccessKey, opts.AWS)
 	_, azureSecrets, azureSummary := buildAzureIdentity(steps, opts.AzureCredsJSON)
 
-	// Per-`environment:` secrets/vars overlay (CLAUDE.md §4 multi-env). The job may
+	// Per-`environment:` secrets/vars overlay. The job may
 	// target a deployment environment (e.g. `environment: production`) whose secrets/
 	// vars differ from the flat defaults; GHA scopes them by environment and act knows
 	// nothing of that, so we resolve the overlay ourselves. Layer flat defaults ← the
@@ -339,86 +247,30 @@ func New(opts Options) (*Session, error) {
 		}
 	}
 
-	// Runtime context GitHub injects that a clean local runner lacks (CLAUDE.md §4):
+	// Runtime context GitHub injects that a clean local runner lacks:
 	// GITHUB_TOKEN, workflow inputs, the event payload, and the github.* context.
-	// Each is seeded here and reported via a transparency line; none needs a fork patch.
-	token, tokenSummary := resolveToken(opts.GitHubToken, secrets) // also mirrors token into secrets.GITHUB_TOKEN
-	eventPath, eventFile, eventSummary, err := buildEvent(opts)
+	rc, err := buildRuntimeContext(opts, run, secrets)
 	if err != nil {
 		return nil, err
 	}
-	// buildEvent may have written a temp event.json; the Session owns it and
-	// removes it on cleanup, but until it's constructed an early error return
-	// below (workdir/source Abs, MkdirTemp) would leak the file. Drop it on any
-	// failure path; cleared once the Session takes ownership.
+	// buildEvent may have written a temp event.json; the Session owns it and removes
+	// it on cleanup, but until it's constructed an early error return below
+	// (resolveWorkspace) would leak the file. Drop it on any failure path; cleared
+	// once the Session takes ownership.
 	ok := false
 	defer func() {
-		if !ok && eventFile != "" {
-			_ = os.Remove(eventFile)
+		if !ok && rc.eventFile != "" {
+			_ = os.Remove(rc.eventFile)
 		}
 	}()
-	inputsSummary := summarizeInputs(run.Workflow, opts.EventName, opts.Inputs)
-	ghcEnv, ghcSummary := buildGitHubContext(opts)
 
-	workdir := opts.Workdir
-	var tmpDir, bindWS, checkoutSource string
-	switch {
-	case workdir != "":
-		// explicit bind: the mounted tree already holds the code, so an intercepted
-		// checkout is a pure no-op (no copy). act maps the container action path
-		// from Config.Workdir, so it must be absolute (act's CLI abs's it too).
-		if workdir, err = filepath.Abs(workdir); err != nil {
-			return nil, fmt.Errorf("debugger: workdir: %w", err)
-		}
-		bindWS = workdir
-	case len(checkouts) > 0:
-		// copy the source tree into the workspace at checkout time (no host mutation).
-		src := opts.Source
-		if src == "" {
-			if src, err = os.Getwd(); err != nil {
-				return nil, fmt.Errorf("debugger: source dir: %w", err)
-			}
-		}
-		if workdir, err = filepath.Abs(src); err != nil {
-			return nil, fmt.Errorf("debugger: source dir: %w", err)
-		}
-		checkoutSource = workdir
-	default:
-		// no workspace needed: an empty temp dir keeps the repo (incl. the act
-		// submodule) out of the container.
-		if workdir, err = os.MkdirTemp("", "actl-"); err != nil {
-			return nil, fmt.Errorf("debugger: temp workdir: %w", err)
-		}
-		tmpDir = workdir
+	// Decide the workspace (explicit bind / copy-at-checkout / isolated temp), then
+	// assemble the barrier interceptors now that the workspace mode is known.
+	workdir, tmpDir, bindWS, checkoutSource, err := resolveWorkspace(opts, len(checkouts) > 0)
+	if err != nil {
+		return nil, err
 	}
-
-	// Assemble the interceptor list now the workspace mode is known: a copy-mode
-	// checkout populates the workspace at its position (CopyWorkdir), while a bind/
-	// temp workspace already holds the code so the rewritten checkout is a pure no-op
-	// (inject nil). Only attach interceptors that actually own a step.
-	var interceptors []stepInterceptor
-	if len(checkouts) > 0 {
-		var inject func(context.Context, runner.StepBarrierInfo) error
-		if checkoutSource != "" {
-			inject = func(ctx context.Context, info runner.StepBarrierInfo) error {
-				if info.CopyWorkdir == nil {
-					return nil
-				}
-				// Mirror actions/checkout's `submodules:` input: it defaults to
-				// false (submodules are not fetched), and only `true`/`recursive`
-				// pull them in. So the local workspace copy skips submodule paths
-				// unless the step asked for them.
-				return info.CopyWorkdir(ctx, checkoutWantsSubmodules(info.Step))
-			}
-		}
-		interceptors = append(interceptors, stepInterceptor{name: "checkout", steps: checkouts, inject: inject})
-	}
-	if len(gcpItc.steps) > 0 {
-		interceptors = append(interceptors, gcpItc)
-	}
-	if len(awsItc.steps) > 0 {
-		interceptors = append(interceptors, awsItc)
-	}
+	interceptors := assembleInterceptors(checkouts, checkoutSource, gcpItc, awsItc)
 
 	s := &Session{
 		jobID:           run.JobID,
@@ -436,13 +288,13 @@ func New(opts Options) (*Session, error) {
 		gcpSummary:      gcpSummary,
 		awsSummary:      awsSummary,
 		azureSummary:    azureSummary,
-		tokenSummary:    tokenSummary,
-		inputsSummary:   inputsSummary,
-		eventSummary:    eventSummary,
-		ghcSummary:      ghcSummary,
+		tokenSummary:    rc.tokenSummary,
+		inputsSummary:   rc.inputsSummary,
+		eventSummary:    rc.eventSummary,
+		ghcSummary:      rc.ghcSummary,
 		plan:            execPlan,
 		tmpDir:          tmpDir,
-		eventFile:       eventFile,
+		eventFile:       rc.eventFile,
 		pauses:          make(chan PauseEvent),
 		progress:        make(chan ProgressEvent, 256), // lossy: a slow frontend drops, never blocks act
 		resume:          make(chan control),
@@ -458,14 +310,14 @@ func New(opts Options) (*Session, error) {
 	cfg := &runner.Config{
 		Workdir:    workdir,
 		EventName:  opts.EventName,
-		EventPath:  eventPath,            // user-supplied or merged-with-inputs event.json ("" = act synthesizes)
+		EventPath:  rc.eventPath,         // user-supplied or merged-with-inputs event.json ("" = act synthesizes)
 		Inputs:     orEmpty(opts.Inputs), // ignored by act when EventPath is set; harmless otherwise
-		Token:      token,                // github.token (mirrored into secrets.GITHUB_TOKEN above)
+		Token:      rc.token,             // github.token (mirrored into secrets.GITHUB_TOKEN above)
 		Actor:      opts.Actor,           // github.actor ("" → act's "nektos/act" placeholder)
 		Platforms:  buildPlatforms(opts),
 		AutoRemove: true,
-		LogOutput:  true,                                // route step stdout through the logger (captured below)
-		Env:        mergeEnv(orEmpty(opts.Env), ghcEnv), // github.* overrides (GITHUB_REPOSITORY/GITHUB_REF/SHA_REF) layered onto -env
+		LogOutput:  true,                                   // route step stdout through the logger (captured below)
+		Env:        mergeEnv(orEmpty(opts.Env), rc.ghcEnv), // github.* overrides (GITHUB_REPOSITORY/GITHUB_REF/SHA_REF) layered onto -env
 		Secrets:    secrets,
 		Vars:       vars,
 		Matrix:     matrix, // pinned to one combination by selectMatrix (nil for a matrix-less job)
@@ -501,6 +353,109 @@ func New(opts Options) (*Session, error) {
 	}
 	s.runner = r
 	return s, nil
+}
+
+// runtimeContext bundles the runtime surfaces GitHub injects that a clean local runner
+// lacks — the token, event payload, workflow inputs, and github.* context,
+// each with its transparency summary — so New seeds them in one call.
+type runtimeContext struct {
+	token         string
+	tokenSummary  TokenSummary
+	eventPath     string
+	eventFile     string // temp event.json buildEvent may have written; "" if none. The caller owns its cleanup.
+	eventSummary  EventSummary
+	inputsSummary InputsSummary
+	ghcEnv        map[string]string
+	ghcSummary    GitHubContextSummary
+}
+
+// buildRuntimeContext seeds the GitHub-injected runtime context: GITHUB_TOKEN (also
+// mirrored into secrets.GITHUB_TOKEN, mutating the passed secrets map), the event payload,
+// workflow inputs, and the github.* context. Each is reported via a transparency line and
+// none needs a fork patch. The returned eventFile (if non-empty) is a temp file the caller
+// must remove once the Session owns it.
+func buildRuntimeContext(opts Options, run *model.Run, secrets map[string]string) (runtimeContext, error) {
+	token, tokenSummary := resolveToken(opts.GitHubToken, secrets) // also mirrors token into secrets.GITHUB_TOKEN
+	eventPath, eventFile, eventSummary, err := buildEvent(opts)
+	if err != nil {
+		return runtimeContext{}, err
+	}
+	ghcEnv, ghcSummary := buildGitHubContext(opts)
+	return runtimeContext{
+		token:         token,
+		tokenSummary:  tokenSummary,
+		eventPath:     eventPath,
+		eventFile:     eventFile,
+		eventSummary:  eventSummary,
+		inputsSummary: summarizeInputs(run.Workflow, opts.EventName, opts.Inputs),
+		ghcEnv:        ghcEnv,
+		ghcSummary:    ghcSummary,
+	}, nil
+}
+
+// resolveWorkspace decides the job's workspace: an explicit -workdir is
+// bind-mounted (the mounted tree already holds the code, so a checkout becomes a pure
+// no-op; act needs the path absolute); else if there's a default checkout to satisfy, the
+// source tree is copied into the workspace at checkout time (no host mutation); else an
+// isolated empty temp dir keeps the repo out of the container. Exactly one of bindWS /
+// checkoutSource / tmpDir is non-empty, and workdir is the absolute path handed to act.
+func resolveWorkspace(opts Options, hasCheckout bool) (workdir, tmpDir, bindWS, checkoutSource string, err error) {
+	switch {
+	case opts.Workdir != "":
+		if workdir, err = filepath.Abs(opts.Workdir); err != nil {
+			return "", "", "", "", fmt.Errorf("debugger: workdir: %w", err)
+		}
+		bindWS = workdir
+	case hasCheckout:
+		src := opts.Source
+		if src == "" {
+			if src, err = os.Getwd(); err != nil {
+				return "", "", "", "", fmt.Errorf("debugger: source dir: %w", err)
+			}
+		}
+		if workdir, err = filepath.Abs(src); err != nil {
+			return "", "", "", "", fmt.Errorf("debugger: source dir: %w", err)
+		}
+		checkoutSource = workdir
+	default:
+		// an empty temp dir keeps the repo (incl. the act submodule) out of the container.
+		if workdir, err = os.MkdirTemp("", "actl-"); err != nil {
+			return "", "", "", "", fmt.Errorf("debugger: temp workdir: %w", err)
+		}
+		tmpDir = workdir
+	}
+	return workdir, tmpDir, bindWS, checkoutSource, nil
+}
+
+// assembleInterceptors builds the barrier-driven interceptor list once the workspace mode
+// is known. A copy-mode checkout (checkoutSource set) populates the workspace at its
+// position via CopyWorkdir; a bind/temp workspace already holds the code, so the rewritten
+// checkout is a pure no-op (nil inject). Each identity interceptor is attached only when it
+// actually owns a step, so adding a new cloud is one more argument here.
+func assembleInterceptors(checkouts map[int]bool, checkoutSource string, identity ...stepInterceptor) []stepInterceptor {
+	var interceptors []stepInterceptor
+	if len(checkouts) > 0 {
+		var inject func(context.Context, runner.StepBarrierInfo) error
+		if checkoutSource != "" {
+			inject = func(ctx context.Context, info runner.StepBarrierInfo) error {
+				if info.CopyWorkdir == nil {
+					return nil
+				}
+				// Mirror actions/checkout's `submodules:` input: it defaults to
+				// false (submodules are not fetched), and only `true`/`recursive`
+				// pull them in. So the local workspace copy skips submodule paths
+				// unless the step asked for them.
+				return info.CopyWorkdir(ctx, checkoutWantsSubmodules(info.Step))
+			}
+		}
+		interceptors = append(interceptors, stepInterceptor{name: "checkout", steps: checkouts, inject: inject})
+	}
+	for _, itc := range identity {
+		if len(itc.steps) > 0 {
+			interceptors = append(interceptors, itc)
+		}
+	}
+	return interceptors
 }
 
 // JobID is the id of the job being debugged.
@@ -558,7 +513,7 @@ func (s *Session) GCPSummary() IdentitySummary { return s.gcpSummary }
 func (s *Session) AWSSummary() IdentitySummary { return s.awsSummary }
 
 // AzureSummary returns the redacted view of the Azure identity handling, for a
-// transparency line. Azure has no ambient fallback (CLAUDE.md §4). Its Steps/Declared are
+// transparency line. Azure has no ambient fallback. Its Steps/Declared are
 // empty when the job has no azure/login step.
 func (s *Session) AzureSummary() IdentitySummary { return s.azureSummary }
 
@@ -756,7 +711,7 @@ func (s *Session) Env() map[string]string {
 
 // ContainerName is the docker name of the live job container at the current
 // pause (empty while running or if no container is in use). A frontend can drop
-// an interactive shell into it; the core stays out of the terminal (CLAUDE.md §5).
+// an interactive shell into it; the core stays out of the terminal.
 func (s *Session) ContainerName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -937,11 +892,4 @@ func resolveBreakpoints(steps []*model.Step, indices []int, names []string) (map
 		out[idx] = true
 	}
 	return out, nil
-}
-
-func toWhen(w runner.BarrierWhen) When {
-	if w == runner.BarrierAfter {
-		return After
-	}
-	return Before
 }
