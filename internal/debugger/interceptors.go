@@ -12,7 +12,7 @@ import (
 )
 
 // GCPIdentity is the host-resolved ambient GCP credentials the CLI passes in for the
-// opt-in ambient fallback (CLAUDE.md §4). The default identity path is bring-a-credential
+// opt-in ambient fallback. The default identity path is bring-a-credential
 // (a service-account key, see Options.GCPKeyJSON); ambient is used only when the dev opts
 // in with -gcp-ambient. Locally there is no GitHub OIDC issuer, so a federated
 // `google-github-actions/auth` (WIF) can't mint a token; ambient intercepts that step and
@@ -25,7 +25,7 @@ type GCPIdentity struct {
 }
 
 // AWSIdentity is the host-resolved ambient AWS credentials for the opt-in ambient
-// fallback (CLAUDE.md §4), the AWS analog of GCPIdentity. The default is bring-a-credential
+// fallback, the AWS analog of GCPIdentity. The default is bring-a-credential
 // (static keys, see Options.AWSAccessKeyID/AWSSecretAccessKey); ambient is used only with
 // -aws-ambient. Unlike GCP these are env-only — no file is mounted — so the core just
 // injects them at the step's position. Discovery is a host concern (cmd/actl).
@@ -41,7 +41,7 @@ const gcpCredsContainerPath = "/actl/gcp/adc.json"
 
 // Reserved secret names the brought-credential substitution loads into Config.Secrets so
 // act's valueMasker (runner/logger.go) masks them in logs, then references from the
-// rewritten step's `with:` via ${{ secrets.<name> }}. CLAUDE.md §4.
+// rewritten step's `with:` via ${{ secrets.<name> }}.
 const (
 	gcpKeySecret       = "ACTL_GCP_CREDENTIALS_JSON"
 	azureCredsSecret   = "ACTL_AZURE_CREDENTIALS"
@@ -226,7 +226,7 @@ func gcpTarget(st *model.Step) string {
 
 // rewriteGCPToKey converts a federated (WIF) auth step into service-account-key mode,
 // referencing the brought key as a masked secret expression — the real action then runs
-// a faithful key auth. CLAUDE.md §4 (bring-a-credential default).
+// a faithful key auth (the bring-a-credential default).
 func rewriteGCPToKey(st *model.Step) {
 	if st.With == nil {
 		st.With = map[string]string{}
@@ -265,7 +265,7 @@ func gcpBind(id *GCPIdentity) string {
 }
 
 // buildGCPIdentity classifies the job's google-github-actions/auth steps and handles the
-// federated ones by the identity strategy (CLAUDE.md §4): a brought SA key rewrites them
+// federated ones by the identity strategy: a brought SA key rewrites them
 // to key mode so the real action runs (default); else the opt-in ambient fallback no-ops
 // them and injects ambient creds; else they're neutralized with an honest summary. Returns
 // the (possibly empty) ambient interceptor, the reserved secrets to register, and the
@@ -348,7 +348,7 @@ func firstAWSRegion(steps []*model.Step, fed []int) string {
 
 // rewriteAWSToKeys converts a federated (role-to-assume) auth step into static-key mode,
 // referencing the brought keys as masked secret expressions; the declared aws-region is
-// kept so the real action exports it. Direct credentials, no sts:AssumeRole (CLAUDE.md §4).
+// kept so the real action exports it. Direct credentials, no sts:AssumeRole.
 func rewriteAWSToKeys(st *model.Step) {
 	if st.With == nil {
 		st.With = map[string]string{}
@@ -448,7 +448,7 @@ func azureTarget(st *model.Step) string {
 
 // rewriteAzureToCreds converts a federated (OIDC) azure/login step into
 // service-principal-secret mode, referencing the brought creds JSON as a masked secret
-// expression; the real action then runs a faithful SP login. CLAUDE.md §4. Azure has no
+// expression; the real action then runs a faithful SP login. Azure has no
 // ambient fallback (it would mean mounting ~/.azure, a refresh-token-bearing personal
 // credential — the worst-blast-radius variant of what this pivot moves away from).
 func rewriteAzureToCreds(st *model.Step) {

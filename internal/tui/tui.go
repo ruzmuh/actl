@@ -1,7 +1,7 @@
 // Package tui is the Bubble Tea front-end for actl. It is one consumer of the
 // debugger core (internal/debugger) and holds no debug logic of its own: it
 // renders pause state + logs and translates keypresses into core commands
-// (Step/Continue/Abort). Per CLAUDE.md §5 the dependency arrow points one way —
+// (Step/Continue/Abort). The dependency arrow points one way —
 // tui imports debugger, never the reverse.
 package tui
 
@@ -153,7 +153,7 @@ func noticeLines(sess *debugger.Session) []string {
 // envLine renders the per-`environment:` overlay applied for the debugged job: the
 // deployment environment it targets and how many secrets/vars its overlay contributed.
 // GHA scopes secrets/vars by environment, so debugging deploy-prod with staging values
-// is silently wrong — this honest notice is the point (CLAUDE.md §4 multi-env). Empty
+// is silently wrong — this honest notice is the point. Empty
 // when the job targets no environment.
 func envLine(s debugger.EnvSummary) string {
 	if s.Name == "" {
@@ -180,7 +180,7 @@ func servicesLine(s debugger.ServicesSummary) string {
 // secret/key-mode steps run as declared (untouched), and for each federated auth step the
 // federation it would have used in real CI vs how actl satisfied it locally — a brought
 // scoped credential (the default), the opt-in ambient personal login, or nothing. The
-// honesty here is itself a feature (CLAUDE.md §4). Empty when the job has no auth step for
+// honesty here is itself a feature. Empty when the job has no auth step for
 // this cloud. Shared by GCP, AWS, and Azure.
 func identityLines(s debugger.IdentitySummary) []string {
 	name := strings.ToLower(s.Cloud)
@@ -364,7 +364,7 @@ func eventLine(e debugger.EventSummary) string {
 	return fmt.Sprintf("event payload: %s (event_name=%s)", e.Path, e.EventName)
 }
 
-// ghcLine renders the synthesized github.* runtime context (CLAUDE.md §4): the
+// ghcLine renders the synthesized github.* runtime context: the
 // repository/ref/sha actl resolved from local git (or you overrode), and the
 // placeholders a clean local runner can't know (actor, run ids). Honest visibility
 // into what the workflow stands on locally.
@@ -549,7 +549,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if name := m.sess.ContainerName(); name != "" {
 					// Hand the terminal to an interactive shell in the live
 					// container, then resume the TUI. The core stays out of the
-					// terminal; this is the frontend's job (CLAUDE.md §5).
+					// terminal; this is the frontend's job.
 					return m, m.shellCmd(name)
 				}
 			}
@@ -829,7 +829,7 @@ func (m Model) rerunCmd() tea.Cmd {
 
 // editCmd hands the terminal to $EDITOR on a temp file seeded with initial, then
 // returns the edited content. Like the shell, editing is the frontend's job —
-// the core only applies the result (CLAUDE.md §5).
+// the core only applies the result.
 func (m Model) editCmd(kind editKind, initial string) tea.Cmd {
 	ext := ".sh"
 	if kind == editEnv {

@@ -41,7 +41,7 @@ type Config struct {
 	Identity     Identity              `yaml:"identity"`
 }
 
-// Identity configures cloud identity handling per cloud (CLAUDE.md §4). The default path
+// Identity configures cloud identity handling per cloud. The default path
 // is bring-a-credential (File); ambient personal login is an opt-in fallback (GCP/AWS
 // only — Azure has no ambient mode, so its Ambient is ignored).
 type Identity struct {

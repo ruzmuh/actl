@@ -157,7 +157,7 @@ func main() {
 
 	bpIdx, bpNames := splitBreakpoints(cfg.Breakpoints)
 
-	// Cloud identity (CLAUDE.md §4). Default: bring a credential — a key/creds file
+	// Cloud identity. Default: bring a credential — a key/creds file
 	// rewrites the federated auth step to its secret/key mode so the real action runs.
 	// Ambient personal login is an opt-in fallback (-…-ambient; GCP/AWS only — Azure has
 	// none). The deprecated -gcp-identity/-aws-identity flags alias the ambient bools.

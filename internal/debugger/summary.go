@@ -57,7 +57,7 @@ type GitHubContextSummary struct {
 
 // AuthMode describes how a cloud's federated auth steps were handled locally — the
 // identity strategy is bring-a-credential by default, with ambient personal login only
-// as an opt-in fallback (CLAUDE.md §4). One value per cloud, for the transparency line.
+// as an opt-in fallback. One value per cloud, for the transparency line.
 type AuthMode int
 
 const (
@@ -72,7 +72,7 @@ const (
 // line: which federated auth steps were intercepted, the federation target each would
 // have used in real CI, which mode satisfied them (substituted brought credential /
 // ambient / none), and the identity we run as. No credential material is retained here.
-// Shared by GCP, AWS, and Azure (CLAUDE.md §4).
+// Shared by GCP, AWS, and Azure.
 type IdentitySummary struct {
 	Cloud    string   // "GCP" / "AWS" / "Azure" — names the line
 	Mode     AuthMode // how the federated steps were handled
